@@ -396,6 +396,7 @@ Current v1 limitations you should keep in mind:
 
 ## 15. External References
 
+- https://github.com/havok2-htwo/G3_TADA
 - https://huggingface.co/HumeAI/tada-3b-ml
 - https://huggingface.co/HumeAI/tada-1b
 - https://huggingface.co/HumeAI/tada-codec
