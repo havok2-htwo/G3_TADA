@@ -1,0 +1,237 @@
+:root {
+  color-scheme: light;
+  --bg: #f5efe5;
+  --bg-accent: #ffe2bf;
+  --card: rgba(255, 251, 245, 0.88);
+  --line: rgba(96, 64, 36, 0.14);
+  --text: #26160d;
+  --muted: #6e5849;
+  --accent: #c95d2e;
+  --accent-strong: #8d3410;
+  --shadow: 0 18px 50px rgba(86, 43, 13, 0.12);
+  font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(255, 208, 160, 0.75), transparent 32%),
+    linear-gradient(135deg, var(--bg), #f0e4d4 52%, var(--bg-accent));
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+  border-radius: 16px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: white;
+  padding: 0.9rem 1.1rem;
+  font-weight: 700;
+  transition: transform 140ms ease, opacity 140ms ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+button:disabled {
+  opacity: 0.65;
+  cursor: wait;
+  transform: none;
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  margin-top: 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0.9rem 1rem;
+  background: rgba(255, 255, 255, 0.84);
+  color: var(--text);
+}
+
+label {
+  display: block;
+  font-weight: 600;
+}
+
+audio {
+  width: 100%;
+}
+
+.app-shell {
+  width: min(1180px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 2rem 0 3rem;
+}
+
+.hero-card,
+.panel-card {
+  backdrop-filter: blur(10px);
+  background: var(--card);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow: var(--shadow);
+}
+
+.hero-card {
+  padding: 1.5rem;
+  border-radius: 28px;
+}
+
+.panel-grid {
+  margin-top: 1.25rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.panel-card {
+  border-radius: 24px;
+  padding: 1.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.panel-head h2,
+.hero-card h1,
+.voice-card h3 {
+  margin: 0;
+}
+
+.hero-copy {
+  max-width: 50rem;
+  color: var(--muted);
+}
+
+.eyebrow {
+  margin: 0 0 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.78rem;
+  color: var(--accent-strong);
+  font-weight: 800;
+}
+
+.status-grid {
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.status-pill {
+  padding: 0.85rem 1rem;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid var(--line);
+}
+
+.status-pill span,
+.muted {
+  color: var(--muted);
+}
+
+.status-pill strong {
+  display: block;
+  margin-top: 0.15rem;
+}
+
+.voice-list {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.voice-card {
+  padding: 1rem;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.7);
+  display: grid;
+  gap: 0.7rem;
+}
+
+.warning-box,
+.error-box {
+  margin-top: 1rem;
+  padding: 0.95rem 1rem;
+  border-radius: 16px;
+}
+
+.warning-box {
+  background: rgba(255, 228, 176, 0.7);
+  border: 1px solid rgba(192, 140, 33, 0.35);
+}
+
+.error-box {
+  background: rgba(255, 215, 215, 0.8);
+  border: 1px solid rgba(176, 67, 67, 0.35);
+}
+
+@media (max-width: 980px) {
+  .panel-grid,
+  .status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.field-help {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-top: 0.35rem;
+  display: block;
+}
+
+.button-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.secondary-button {
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--accent-strong);
+  border: 1px solid rgba(141, 52, 16, 0.18);
+}
+
+.stream-box {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.66);
+  padding: 0.95rem 1rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.stream-copy {
+  margin: 0.4rem 0 0;
+}
+
+.stream-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem 1rem;
+  font-size: 0.92rem;
+}
+
+@media (max-width: 700px) {
+  .button-row,
+  .stream-metrics {
+    grid-template-columns: 1fr;
+  }
+}

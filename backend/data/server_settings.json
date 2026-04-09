@@ -1,0 +1,21 @@
+{
+  "active_model": "HumeAI/tada-3b-ml",
+  "steps": 10,
+  "sentence_chunking": true,
+  "short_sentence_merge_max_chars": 30,
+  "following_sentence_merge_min_chars": 20,
+  "allow_lan_access": true,
+  "stream_start_buffer_ms": 1200,
+  "stream_chunk_ms": 600,
+  "batch_wait_ms": 1,
+  "max_batch_size": 16,
+  "max_parallel_requests": 16,
+  "max_queue_size": 255,
+  "model_storage_path": "X:\\dev\\G3_TADA3B\\.hf_cache\\hub",
+  "whisper_base_url": "http://192.168.20.146:7861/v1",
+  "vad_trimming": true,
+  "duration_multiplier": 1.1,
+  "vad_threshold_pct": 0.01,
+  "vad_padding_ms": 50,
+  "vad_fade_ms": 100
+}

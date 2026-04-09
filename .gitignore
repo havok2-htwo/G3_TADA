@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+*.so
+*.pyd
+
+# Virtual environments
+.venv/
+.conda/
+.conda-env/
+.python_packages/
+
+# Runtime markers
+.runtime_package_mode
+
+# Environment / secrets
+.env
+.env.bak
+backend/data/server_secrets.json
+
+# HF / model cache
+.hf_cache/
+
+# Generated audio
+backend/generated/
+
+# Backend data caches
+backend/cache/
+backend/offload/
+
+# Voice data (contains user recordings)
+backend/data/voices/
+voices/
+
+# Temporary files
+.tmp/
+
+# Torch / torchvision wheels
+torchvision/
+wheelhouse/
+
+# ---- Vendor: exclude everything except the TADA source ----
+# The vendor dir is a full pip site-packages dump.
+# Only backend/vendor/tada/ (the patched TADA source) is tracked.
+backend/vendor/*
+!backend/vendor/tada/
+
+# Frontend build artifacts and deps
+frontend/node_modules/
+frontend/dist/
+
+# Releases
+releases/
+
+# Benchmark raw logs
+benchmark_results_*.txt
+benchmark_vram_*.txt
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
