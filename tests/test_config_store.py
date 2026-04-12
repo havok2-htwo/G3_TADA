@@ -2,32 +2,11 @@ from __future__ import annotations
 
 import os
 import tempfile
-import threading
-import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from backend.config_store import ConfigStore
-
-
-class CoordinatedConfigStore(ConfigStore):
-    def __init__(self, project_root: Path):
-        super().__init__(project_root)
-        self.pause_verify_load = threading.Event()
-        self.resume_verify_load = threading.Event()
-        self.pause_verify_thread_name: str | None = None
-
-    def _load_secrets(self) -> dict[str, object]:
-        payload = super()._load_secrets()
-        if (
-            self.pause_verify_thread_name
-            and threading.current_thread().name == self.pause_verify_thread_name
-            and not self.pause_verify_load.is_set()
-        ):
-            self.pause_verify_load.set()
-            self.resume_verify_load.wait(timeout=5)
-        return payload
 
 
 class ConfigStoreTests(unittest.TestCase):
@@ -64,40 +43,25 @@ class ConfigStoreTests(unittest.TestCase):
                 else:
                     os.environ["TADA_ADMIN_KEY"] = previous
 
-    def test_client_keys_can_be_created_verified_and_deleted(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            previous = os.environ.get("TADA_ADMIN_KEY")
-            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
-            try:
-                store = ConfigStore(Path(temp_dir))
-                created = store.create_key(label="Demo", kind="client")
-                verified = store.verify_client_key(created["token"])
-                self.assertIsNotNone(verified)
-                self.assertEqual(verified["label"], "Demo")
-                self.assertTrue(store.delete_client_key(created["id"]))
-                self.assertIsNone(store.verify_client_key(created["token"]))
-            finally:
-                if previous is None:
-                    os.environ.pop("TADA_ADMIN_KEY", None)
-                else:
-                    os.environ["TADA_ADMIN_KEY"] = previous
-
-    def test_client_keys_persist_across_store_reloads(self):
+    def test_admin_key_can_be_rotated_and_persists(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             previous = os.environ.get("TADA_ADMIN_KEY")
             os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
             try:
                 project_root = Path(temp_dir)
                 store = ConfigStore(project_root)
-                created = store.create_key(label="Persistent Demo", kind="client")
+                self.assertTrue(store.verify_admin_key("admin-test-key"))
 
+                rotated = store.rotate_admin_key(label="Rotated Master")
+                self.assertEqual(rotated["label"], "Rotated Master")
+                self.assertTrue(store.verify_admin_key(rotated["token"]))
+                self.assertFalse(store.verify_admin_key("admin-test-key"))
+
+                listed = store.list_keys()
+                self.assertEqual(listed["admin_key"]["label"], "Rotated Master")
                 reloaded_store = ConfigStore(project_root)
-                verified = reloaded_store.verify_client_key(created["token"])
-
-                self.assertIsNotNone(verified)
-                self.assertEqual(verified["label"], "Persistent Demo")
-                listed_labels = {item["label"] for item in reloaded_store.list_keys()["client_keys"]}
-                self.assertIn("Persistent Demo", listed_labels)
+                self.assertTrue(reloaded_store.verify_admin_key(rotated["token"]))
+                self.assertEqual(reloaded_store.list_keys()["admin_key"]["label"], "Rotated Master")
             finally:
                 if previous is None:
                     os.environ.pop("TADA_ADMIN_KEY", None)
@@ -132,54 +96,6 @@ class ConfigStoreTests(unittest.TestCase):
                     os.environ.pop("TADA_STARTUP_ADMIN_KEY_TTL_SECONDS", None)
                 else:
                     os.environ["TADA_STARTUP_ADMIN_KEY_TTL_SECONDS"] = previous_ttl
-
-    def test_concurrent_client_key_use_does_not_drop_newly_created_keys(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            previous = os.environ.get("TADA_ADMIN_KEY")
-            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
-            try:
-                store = CoordinatedConfigStore(Path(temp_dir))
-                existing = store.create_key(label="Existing", kind="client")
-                store.pause_verify_thread_name = "verify-client-thread"
-                results: dict[str, object] = {}
-
-                def verify_existing_key() -> None:
-                    results["verified"] = store.verify_client_key(existing["token"])
-
-                verify_thread = threading.Thread(
-                    target=verify_existing_key,
-                    name="verify-client-thread",
-                )
-                verify_thread.start()
-                self.assertTrue(store.pause_verify_load.wait(timeout=2))
-
-                def create_new_key() -> None:
-                    results["created"] = store.create_key(label="Fresh", kind="client")
-
-                create_thread = threading.Thread(target=create_new_key, name="create-client-thread")
-                create_thread.start()
-                time.sleep(0.2)
-                self.assertTrue(create_thread.is_alive())
-
-                store.resume_verify_load.set()
-                verify_thread.join(timeout=2)
-                create_thread.join(timeout=2)
-
-                self.assertFalse(verify_thread.is_alive())
-                self.assertFalse(create_thread.is_alive())
-                created = results["created"]
-                self.assertIsInstance(created, dict)
-                self.assertIsNotNone(store.verify_client_key(created["token"]))
-
-                client_keys = store.list_keys()["client_keys"]
-                self.assertEqual(len(client_keys), 2)
-                self.assertEqual({item["label"] for item in client_keys}, {"Existing", "Fresh"})
-            finally:
-                if previous is None:
-                    os.environ.pop("TADA_ADMIN_KEY", None)
-                else:
-                    os.environ["TADA_ADMIN_KEY"] = previous
-
 
 if __name__ == "__main__":
     unittest.main()

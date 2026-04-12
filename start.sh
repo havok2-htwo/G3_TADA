@@ -85,6 +85,26 @@ while IFS='=' read -r key value; do
   esac
 done < <("$PYTHON_EXE" "$ROOT/tools/print_launch_settings.py")
 
+export TADA_STARTUP_ADMIN_KEY_TTL_SECONDS="${TADA_STARTUP_ADMIN_KEY_TTL_SECONDS:-300}"
+export TADA_STARTUP_ADMIN_KEY_DISPLAY_SECONDS="${TADA_STARTUP_ADMIN_KEY_DISPLAY_SECONDS:-15}"
+export TADA_STARTUP_ADMIN_KEY="$("$PYTHON_EXE" "$ROOT/tools/generate_startup_admin_key.py" 2>/dev/null || true)"
+
+if [[ -n "$TADA_STARTUP_ADMIN_KEY" ]]; then
+  echo
+  echo "============================================================"
+  echo "Temporary startup admin key (valid for $TADA_STARTUP_ADMIN_KEY_TTL_SECONDS seconds after server start):"
+  echo "$TADA_STARTUP_ADMIN_KEY"
+  echo "Copy it now if you need emergency admin access in the browser."
+  echo "This screen clears automatically in $TADA_STARTUP_ADMIN_KEY_DISPLAY_SECONDS seconds..."
+  echo "============================================================"
+  sleep "$TADA_STARTUP_ADMIN_KEY_DISPLAY_SECONDS"
+  if command -v clear >/dev/null 2>&1; then
+    clear
+  fi
+else
+  echo "[WARN] Temporary startup admin key could not be generated." >&2
+fi
+
 echo "Using Python: $PYTHON_EXE"
 if [[ "$TADA_ALLOW_LAN_ACCESS" == "true" ]]; then
   echo "Starting TADA server on http://$TADA_SERVER_HOST:$TADA_SERVER_PORT (LAN enabled; use this machine's IP address from other devices)"

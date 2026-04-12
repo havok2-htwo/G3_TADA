@@ -177,8 +177,9 @@ class ConfigStore:
                     "hf_token": os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or "",
                     "whisper_api_key": "",
                     "admin_key": None,
-                    "client_keys": [],
                 }
+            else:
+                secrets_payload.pop("client_keys", None)
             if not secrets_payload.get("admin_key"):
                 bootstrap_token = os.getenv("TADA_ADMIN_KEY") or self._generate_raw_key(prefix="tada_admin")
                 secrets_payload["admin_key"] = {
@@ -289,59 +290,32 @@ class ConfigStore:
                 "label": admin_key.get("label") or "Master Admin Key",
                 "created_at": admin_key["created_at"],
                 "last_used_at": admin_key.get("last_used_at"),
-            },
-            "client_keys": [
-                {
-                    "id": item["id"],
-                    "label": item["label"],
-                    "created_at": item["created_at"],
-                    "last_used_at": item.get("last_used_at"),
-                }
-                for item in payload.get("client_keys", [])
-            ],
+            }
         }
 
-    def _generate_raw_key(self, *, prefix: str) -> str:
-        return f"{prefix}_{secrets.token_urlsafe(24)}"
+    def rotate_admin_key(self, *, label: str = "Master Admin Key") -> dict[str, Any]:
+        clean_label = label.strip() or "Master Admin Key"
+        plaintext = self._generate_raw_key(prefix="tada_admin")
 
-    def create_key(self, *, label: str, kind: str) -> dict[str, Any]:
-        clean_label = label.strip() or ("Client Key" if kind == "client" else "Master Admin Key")
-        plaintext = self._generate_raw_key(prefix="tada_client" if kind == "client" else "tada_admin")
-
-        def apply_create(payload: dict[str, Any]) -> dict[str, Any]:
-            record = {
-                "id": secrets.token_hex(8),
+        def apply_rotate(payload: dict[str, Any]) -> dict[str, Any]:
+            payload["admin_key"] = {
+                "id": "admin",
                 "label": clean_label,
                 "hash": hash_token(plaintext),
                 "created_at": now_iso(),
                 "last_used_at": None,
             }
-
-            if kind == "admin":
-                record["id"] = "admin"
-                payload["admin_key"] = record
-            else:
-                payload.setdefault("client_keys", []).append(record)
             return {
-                "kind": kind,
-                "id": record["id"],
+                "id": "admin",
                 "label": clean_label,
                 "token": plaintext,
-                "created_at": record["created_at"],
+                "created_at": payload["admin_key"]["created_at"],
             }
 
-        return self._mutate_secrets(apply_create)
+        return self._mutate_secrets(apply_rotate)
 
-    def delete_client_key(self, key_id: str) -> bool:
-        def apply_delete(payload: dict[str, Any]) -> bool:
-            current_items = payload.get("client_keys", [])
-            remaining = [item for item in current_items if item["id"] != key_id]
-            if len(remaining) == len(current_items):
-                return False
-            payload["client_keys"] = remaining
-            return True
-
-        return self._mutate_secrets(apply_delete)
+    def _generate_raw_key(self, *, prefix: str) -> str:
+        return f"{prefix}_{secrets.token_urlsafe(24)}"
 
     def verify_admin_key(self, raw_key: str) -> bool:
         if not raw_key:
@@ -360,24 +334,5 @@ class ConfigStore:
                 record["last_used_at"] = now_iso()
                 payload["admin_key"] = record
             return is_valid
-
-        return self._mutate_secrets(apply_verify)
-
-    def verify_client_key(self, raw_key: str) -> dict[str, Any] | None:
-        if not raw_key:
-            return None
-        hashed = hash_token(raw_key)
-
-        def apply_verify(payload: dict[str, Any]) -> dict[str, Any] | None:
-            for item in payload.get("client_keys", []):
-                if secrets.compare_digest(item.get("hash") or "", hashed):
-                    item["last_used_at"] = now_iso()
-                    return {
-                        "id": item["id"],
-                        "label": item["label"],
-                        "created_at": item["created_at"],
-                        "last_used_at": item["last_used_at"],
-                    }
-            return None
 
         return self._mutate_secrets(apply_verify)

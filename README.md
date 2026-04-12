@@ -6,7 +6,7 @@ Windows-first workbench around HumeAI TADA with:
 - round-robin sentence batching across concurrent requests
 - React admin frontend and separate React demo client
 - model download/status management for TADA, codec and tokenizer assets
-- API-key based access control for admin and public synthesis
+- admin-key protected dashboard plus open public synthesis API
 - voice management with optional Whisper transcription
 - public streaming API used directly by the demo client
 
@@ -29,13 +29,14 @@ Implemented now:
 
 - persistent server settings in `backend/data/server_settings.json`
 - secret storage in `backend/data/server_secrets.json`
-- master admin key plus separate client API keys
+- single admin key workflow with persistent hashed storage and startup recovery key
 - admin endpoints under `/api/admin/...`
 - public versioned endpoints under `/api/v1/...`
 - round-robin sentence batching with queueing and concurrency limits
 - heterogenous prompt batching for different voices in the same TADA batch
 - progressive preview streaming while the first batch is still running
 - dashboard snapshots and a live dashboard stream endpoint
+- persistent generation history for the admin dashboard
 - model download jobs and local model readiness checks
 - separate `Admin` and `Demo` React frontends built from the same Vite project
 - portable install/start scripts for Windows and Linux source installs
@@ -54,7 +55,7 @@ The runtime has four layers:
 1. Config and secrets
    - `backend/config_store.py`
    - persists runtime settings and secrets
-   - creates or rotates admin/client API keys
+   - creates or rotates the admin key and validates temporary startup admin keys
 
 2. Runtime/model layer
    - `backend/runtime_service.py`
@@ -111,25 +112,25 @@ For each active sentence result:
 
 ## 5. Auth Model
 
-Two header-based key types exist.
+The dashboard is protected by a single admin key, while synthesis stays public.
 
 ### Admin
 
 - header: `X-Admin-Key`
-- scope: all `/api/admin/...` routes
-- used for settings, model downloads, voice management, key rotation and dashboard access
+- scope: all `/api/admin/...` routes plus `GET /api/assets/voices/{voice_id}/reference`
+- used for settings, model downloads, voice management, admin key rotation, dashboard access, and generation history
 - stored hashed in `backend/data/server_secrets.json`
 - a bootstrap admin key is created automatically if none exists and is printed to the server console once
-- `start.bat` also shows a short-lived temporary startup admin key for local recovery right before the server comes up
+- `start.bat` and `start.sh` also show a short-lived temporary startup admin key for local recovery right before the server comes up
 
-### Client
+### Public
 
-- header: `X-API-Key`
-- scope: public synthesis and voice listing under `/api/v1/...`
-- stored hashed in `backend/data/server_secrets.json`
-- created from the admin panel or admin API
+- `GET /api/v1/voices` is open
+- `POST /api/v1/synthesize` is open
+- `POST /api/v1/synthesize/stream` is open
+- `GET /api/assets/generated/{file_name}` is open so public responses remain directly usable
 
-Asset helper routes under `/api/assets/...` accept either valid header so both frontends can fetch protected audio files.
+Reference voice audio stays admin-only because it exposes the underlying stored prompt material.
 
 ## 6. Settings and Persistence
 
@@ -206,7 +207,7 @@ For a dedicated endpoint-by-endpoint integration reference, see [API_DOCUMENTATI
 ### Headers
 
 - admin routes: `X-Admin-Key`
-- public routes: `X-API-Key`
+- public routes: none
 
 ### Admin routes
 
@@ -220,7 +221,7 @@ For a dedicated endpoint-by-endpoint integration reference, see [API_DOCUMENTATI
 - `POST /api/admin/voices/transcribe`
 - `GET /api/admin/keys`
 - `POST /api/admin/keys`
-- `DELETE /api/admin/keys/{id}`
+- `GET /api/admin/generations`
 - `GET /api/admin/dashboard/stream`
 
 ### Public routes
@@ -228,10 +229,10 @@ For a dedicated endpoint-by-endpoint integration reference, see [API_DOCUMENTATI
 - `GET /api/v1/voices`
 - `POST /api/v1/synthesize`
 - `POST /api/v1/synthesize/stream`
-
-### Protected asset routes
-
 - `GET /api/assets/generated/{file_name}`
+
+### Admin-only asset routes
+
 - `GET /api/assets/voices/{voice_id}/reference`
 
 ### Streaming event types
@@ -267,9 +268,9 @@ Responsibilities:
 - enter or rotate the admin key
 - manage settings and secrets
 - watch queue/dashboard metrics
+- inspect the latest generation history
 - trigger model downloads
 - create voices
-- create/delete client keys
 
 ### Demo frontend
 
@@ -279,7 +280,6 @@ URL:
 
 Responsibilities:
 
-- enter a client API key
 - run a live single-request stream against the public API
 - run multi-request benchmarks against the same public API
 - choose a local output folder via the File System Access API
@@ -296,7 +296,7 @@ Most relevant files after the refactor:
 - `backend/server_app.py`: FastAPI app, route layer and static frontend serving
 - `backend/runtime_service.py`: runtime service, voice creation, batch generation, model downloads
 - `backend/batch_scheduler.py`: request queue, fairness, streaming and dashboard metrics
-- `backend/config_store.py`: persistent settings, secrets and API-key management
+- `backend/config_store.py`: persistent settings, secrets and admin-key management
 - `backend/prompt_batch.py`: sentence splitting, waveform chunking and prompt merging
 - `backend/vendor/tada/modules/tada.py`: patched to support true heterogeneous prompt batching
 - `frontend/admin.html`: admin entry page
@@ -316,11 +316,11 @@ Validated in this repo now:
 
 Current automated tests cover:
 
-- config persistence and API-key behavior
+- config persistence and admin-key behavior
 - prompt batch merging
 - round-robin scheduler ordering
 - progressive preview chunk emission without duplicated samples
-- basic admin/public API auth wiring
+- basic admin/public API auth wiring, open public routes, and generation history
 - release bundle model-cache copying
 
 ## 13. Quick Start
@@ -349,6 +349,7 @@ Notes:
 - if `frontend/dist` already exists, npm is not required on the target machine
 - if `wheelhouse/` exists, the installer uses it as an offline package source
 - `TADA_CONDA_EXE`, `TADA_CONDA_ENV_DIR`, `TADA_CONDA_PYTHON_VERSION`, `TADA_TORCH_INDEX_URL` and `TADA_PYTHON` can override the default install behavior
+- `start.bat` prints a temporary startup admin key before launch; the dashboard itself is then opened at `/admin`
 - the Admin settings page can enable `LAN Access`; after saving, restart the server and then use `http://<server-ip>:7878/admin` or `http://<server-ip>:7878/demo` from other devices in the same network
 
 ### Linux source install

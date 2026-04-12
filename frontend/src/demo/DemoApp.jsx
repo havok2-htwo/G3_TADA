@@ -3,8 +3,6 @@ import { useEffect, useRef, useState } from "react";
 import { createWavBlobFromInt16Chunks, decodePcm16Base64, saveBlobToFile } from "../shared/audio";
 import { apiFetch, formatDate, formatMs, formatSeconds, streamNdjson } from "../shared/api";
 
-const CLIENT_KEY_STORAGE = "tada_client_key";
-
 function nowStamp() {
   const value = new Date();
   const parts = [
@@ -20,8 +18,6 @@ function nowStamp() {
 }
 
 export default function DemoApp() {
-  const [clientKey, setClientKey] = useState(() => sessionStorage.getItem(CLIENT_KEY_STORAGE) || "");
-  const [clientKeyInput, setClientKeyInput] = useState(() => sessionStorage.getItem(CLIENT_KEY_STORAGE) || "");
   const [voices, setVoices] = useState([]);
   const [selectedVoiceId, setSelectedVoiceId] = useState("");
   const [text, setText] = useState("Hallo! Das ist ein echter Batch-Streaming-Test fuer den neuen TADA-Server.");
@@ -42,10 +38,7 @@ export default function DemoApp() {
   const singleAbortRef = useRef(null);
 
   useEffect(() => {
-    if (!clientKey) {
-      return;
-    }
-    apiFetch("/api/v1/voices", { clientKey })
+    apiFetch("/api/v1/voices")
       .then((data) => {
         setVoices(data.voices || []);
         if (!selectedVoiceId && data.voices?.length) {
@@ -53,7 +46,7 @@ export default function DemoApp() {
         }
       })
       .catch((loadError) => setError(loadError.message));
-  }, [clientKey, selectedVoiceId]);
+  }, [selectedVoiceId]);
 
   useEffect(() => () => {
     if (audioContextRef.current) {
@@ -93,12 +86,6 @@ export default function DemoApp() {
     nextPlaybackTimeRef.current = startAt + buffer.duration;
   }
 
-  function persistClientKey(nextKey) {
-    sessionStorage.setItem(CLIENT_KEY_STORAGE, nextKey);
-    setClientKey(nextKey);
-    setClientKeyInput(nextKey);
-  }
-
   async function runStreamingJob({ playback = false, signal } = {}) {
     if (!selectedVoiceId) {
       throw new Error("Please choose a voice first.");
@@ -113,7 +100,6 @@ export default function DemoApp() {
     let finalResult = null;
 
     await streamNdjson("/api/v1/synthesize/stream", {
-      clientKey,
       body: { text, voice_id: selectedVoiceId },
       signal,
       onEvent: async (event) => {
@@ -159,7 +145,7 @@ export default function DemoApp() {
   async function resolveResultBlob(outcome) {
     if (outcome?.result?.audio_url) {
       try {
-        return await apiFetch(outcome.result.audio_url, { clientKey, responseType: "blob" });
+        return await apiFetch(outcome.result.audio_url, { responseType: "blob" });
       } catch {
         return null;
       }
@@ -282,40 +268,15 @@ export default function DemoApp() {
     }
   }
 
-  if (!clientKey) {
-    return (
-      <main className="auth-shell">
-        <section className="panel stack">
-          <p className="eyebrow">Demo Client Login</p>
-          <h1>TADA Demo Client</h1>
-          <p className="muted">Enter a client API key created in the admin panel.</p>
-          <input value={clientKeyInput} onChange={(event) => setClientKeyInput(event.target.value)} placeholder="tada_client_..." />
-          <button type="button" onClick={() => persistClientKey(clientKeyInput.trim())} disabled={!clientKeyInput.trim()}>
-            Open Demo Client
-          </button>
-        </section>
-      </main>
-    );
-  }
-
   return (
     <main className="page-shell">
       <section className="hero">
         <div>
-          <p className="eyebrow">Public Demo Client</p>
+          <p className="eyebrow">Public TTS Demo</p>
           <h1>Streaming and Parallel Load Testing</h1>
           <p className="hero-copy">
-            This UI uses the same public client API that other projects will call. Single request mode plays live audio, while benchmark mode stores WAV files and metrics locally in your selected folder.
+            This UI uses the same open public API that other projects can call. Single request mode plays live audio, while benchmark mode stores WAV files and metrics locally in your selected folder.
           </p>
-          <div className="button-row" style={{ marginTop: 16 }}>
-            <button type="button" className="ghost" onClick={() => {
-              sessionStorage.removeItem(CLIENT_KEY_STORAGE);
-              setClientKey("");
-              setClientKeyInput("");
-            }}>
-              Logout
-            </button>
-          </div>
         </div>
 
         <div className="status-grid">

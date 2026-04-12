@@ -10,7 +10,6 @@ export class ApiError extends Error {
 export async function apiFetch(url, options = {}) {
   const {
     adminKey,
-    clientKey,
     headers = {},
     body,
     responseType = "json",
@@ -20,9 +19,6 @@ export async function apiFetch(url, options = {}) {
   const nextHeaders = { ...headers };
   if (adminKey) {
     nextHeaders["X-Admin-Key"] = adminKey;
-  }
-  if (clientKey) {
-    nextHeaders["X-API-Key"] = clientKey;
   }
 
   const requestOptions = {
@@ -54,19 +50,16 @@ export async function apiFetch(url, options = {}) {
   return response.json().catch(() => ({}));
 }
 
-export async function loadProtectedAudioUrl(url, { adminKey, clientKey } = {}) {
-  const blob = await apiFetch(url, { adminKey, clientKey, responseType: "blob" });
+export async function loadProtectedAudioUrl(url, { adminKey } = {}) {
+  const blob = await apiFetch(url, { adminKey, responseType: "blob" });
   return URL.createObjectURL(blob);
 }
 
 export async function streamNdjson(url, options) {
-  const { adminKey, clientKey, body, signal, onEvent } = options;
+  const { adminKey, body, signal, onEvent } = options;
   const headers = {};
   if (adminKey) {
     headers["X-Admin-Key"] = adminKey;
-  }
-  if (clientKey) {
-    headers["X-API-Key"] = clientKey;
   }
   if (!(body instanceof FormData)) {
     headers["Content-Type"] = "application/json";

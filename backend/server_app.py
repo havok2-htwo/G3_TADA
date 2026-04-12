@@ -57,11 +57,6 @@ class ModelDownloadRequest(BaseModel):
     model_id: str
 
 
-class KeyCreateRequest(BaseModel):
-    label: str = ""
-    kind: str = Field(default="client", pattern="^(client|admin)$")
-
-
 class PublicSynthesizeRequest(BaseModel):
     text: str
     voice_id: str
@@ -75,27 +70,6 @@ def require_admin_key(x_admin_key: Optional[str] = Header(None)) -> dict[str, st
     if not config_store.verify_admin_key((x_admin_key or "").strip()):
         raise _unauthorized("A valid X-Admin-Key header is required.")
     return {"role": "admin"}
-
-
-def require_client_key(x_api_key: Optional[str] = Header(None)) -> dict[str, Any]:
-    record = config_store.verify_client_key((x_api_key or "").strip())
-    if record is None:
-        raise _unauthorized("A valid X-API-Key header is required.")
-    return record
-
-
-def require_asset_access(
-    x_admin_key: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None),
-) -> dict[str, Any]:
-    admin_key = (x_admin_key or "").strip()
-    if admin_key and config_store.verify_admin_key(admin_key):
-        return {"role": "admin"}
-    client_key = (x_api_key or "").strip()
-    record = config_store.verify_client_key(client_key)
-    if record is not None:
-        return record
-    raise _unauthorized("A valid X-Admin-Key or X-API-Key header is required.")
 
 
 app = FastAPI(title="TADA Batch TTS Server", version="1.0.0")
@@ -282,18 +256,13 @@ def admin_keys(_: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]
 
 
 @app.post("/api/admin/keys")
-def admin_create_key(
-    request: KeyCreateRequest,
-    _: dict[str, str] = Depends(require_admin_key),
-) -> dict[str, Any]:
-    return {"key": config_store.create_key(label=request.label, kind=request.kind), "keys": config_store.list_keys()}
+def admin_rotate_key(_: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]:
+    return {"key": config_store.rotate_admin_key(), "keys": config_store.list_keys()}
 
 
-@app.delete("/api/admin/keys/{key_id}")
-def admin_delete_key(key_id: str, _: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]:
-    if not config_store.delete_client_key(key_id):
-        raise HTTPException(status_code=404, detail=f"Client key '{key_id}' was not found.")
-    return {"ok": True, "keys": config_store.list_keys()}
+@app.get("/api/admin/generations")
+def admin_generations(_: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]:
+    return {"generations": runtime_service.list_recent_generations()}
 
 
 @app.get("/api/admin/dashboard/stream")
@@ -306,14 +275,13 @@ def admin_dashboard_stream(_: dict[str, str] = Depends(require_admin_key)) -> St
 
 
 @app.get("/api/v1/voices")
-def public_voices(_: dict[str, Any] = Depends(require_client_key)) -> dict[str, Any]:
+def public_voices() -> dict[str, Any]:
     return {"voices": runtime_service.list_voices()}
 
 
 @app.post("/api/v1/synthesize")
 def public_synthesize(
     request: PublicSynthesizeRequest,
-    _: dict[str, Any] = Depends(require_client_key),
 ) -> dict[str, Any]:
     try:
         runtime_service.get_voice(request.voice_id)
@@ -330,7 +298,6 @@ def public_synthesize(
 @app.post("/api/v1/synthesize/stream")
 def public_synthesize_stream(
     request: PublicSynthesizeRequest,
-    _: dict[str, Any] = Depends(require_client_key),
 ) -> StreamingResponse:
     try:
         runtime_service.get_voice(request.voice_id)
@@ -352,7 +319,6 @@ def public_synthesize_stream(
 @app.get("/api/assets/generated/{file_name}")
 def generated_audio(
     file_name: str,
-    _: dict[str, Any] = Depends(require_asset_access),
 ) -> FileResponse:
     try:
         path = runtime_service.generated_audio_path(file_name)
@@ -364,7 +330,7 @@ def generated_audio(
 @app.get("/api/assets/voices/{voice_id}/reference")
 def voice_reference(
     voice_id: str,
-    _: dict[str, Any] = Depends(require_asset_access),
+    _: dict[str, str] = Depends(require_admin_key),
 ) -> FileResponse:
     try:
         path = runtime_service.reference_audio_path(voice_id)

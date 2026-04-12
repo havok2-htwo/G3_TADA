@@ -14,6 +14,7 @@ from backend.runtime_service import DuplicateVoiceNameError
 
 class FakeRuntimeService:
     def __init__(self):
+        temp_root = Path(tempfile.gettempdir())
         self.settings_saved = None
         self.voices = {
             "demo-voice": {
@@ -23,6 +24,24 @@ class FakeRuntimeService:
                 "reference_url": "/api/assets/voices/demo-voice/reference",
             }
         }
+        self.generated_file = temp_root / "tada-generated-test.wav"
+        self.reference_file = temp_root / "tada-reference-test.wav"
+        self.generated_file.write_bytes(b"RIFFdemo")
+        self.reference_file.write_bytes(b"RIFFdemo")
+        self.generations = [
+            {
+                "generation_id": "gen-001",
+                "created_at": "2026-04-10T10:00:00+00:00",
+                "voice_id": "demo-voice",
+                "voice_name": "Demo",
+                "text": "Hallo Welt",
+                "duration_seconds": 1.5,
+                "ttft_ms": 120.0,
+                "total_wall_ms": 420.0,
+                "batch_count": 1,
+                "audio_url": "/api/assets/generated/tada-generated-test.wav",
+            }
+        ]
 
     def status(self):
         return {
@@ -87,6 +106,15 @@ class FakeRuntimeService:
             "was_auto_trimmed": False,
         }
 
+    def list_recent_generations(self, *, limit=60):
+        return self.generations[:limit]
+
+    def generated_audio_path(self, file_name):
+        return self.generated_file
+
+    def reference_audio_path(self, voice_id):
+        return self.reference_file
+
 
 class FakeScheduler:
     def dashboard_snapshot(self):
@@ -147,7 +175,7 @@ class ServerApiTests(unittest.TestCase):
                 else:
                     os.environ["TADA_DISABLE_WARMUP"] = previous_warmup
 
-    def test_admin_and_public_routes_use_header_auth(self):
+    def test_admin_routes_require_key_but_public_routes_are_open(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             previous_admin = os.environ.get("TADA_ADMIN_KEY")
             previous_warmup = os.environ.get("TADA_DISABLE_WARMUP")
@@ -156,23 +184,68 @@ class ServerApiTests(unittest.TestCase):
             try:
                 module = importlib.import_module("backend.server_app")
                 module.config_store = ConfigStore(Path(temp_dir))
-                admin_token = module.config_store.create_key(label="Master", kind="admin")["token"]
-                client_key = module.config_store.create_key(label="Demo", kind="client")["token"]
+                admin_token = module.config_store.rotate_admin_key(label="Master")["token"]
                 module.runtime_service = FakeRuntimeService()
                 module.scheduler = FakeScheduler()
 
                 with TestClient(module.app) as client:
+                    missing_admin = client.get("/api/admin/settings")
+                    self.assertEqual(missing_admin.status_code, 401)
                     admin_response = client.get("/api/admin/settings", headers={"X-Admin-Key": admin_token})
                     self.assertEqual(admin_response.status_code, 200)
-                    public_response = client.get("/api/v1/voices", headers={"X-API-Key": client_key})
+                    public_response = client.get("/api/v1/voices")
                     self.assertEqual(public_response.status_code, 200)
                     synth_response = client.post(
                         "/api/v1/synthesize",
-                        headers={"X-API-Key": client_key},
                         json={"text": "Hallo", "voice_id": "demo-voice"},
                     )
                     self.assertEqual(synth_response.status_code, 200)
                     self.assertEqual(synth_response.json()["generation_id"], "fake")
+                    asset_response = client.get("/api/assets/generated/tada-generated-test.wav")
+                    self.assertEqual(asset_response.status_code, 200)
+                    reference_denied = client.get("/api/assets/voices/demo-voice/reference")
+                    self.assertEqual(reference_denied.status_code, 401)
+                    reference_allowed = client.get(
+                        "/api/assets/voices/demo-voice/reference",
+                        headers={"X-Admin-Key": admin_token},
+                    )
+                    self.assertEqual(reference_allowed.status_code, 200)
+            finally:
+                if previous_admin is None:
+                    os.environ.pop("TADA_ADMIN_KEY", None)
+                else:
+                    os.environ["TADA_ADMIN_KEY"] = previous_admin
+                if previous_warmup is None:
+                    os.environ.pop("TADA_DISABLE_WARMUP", None)
+                else:
+                    os.environ["TADA_DISABLE_WARMUP"] = previous_warmup
+
+    def test_admin_keys_rotation_and_generation_history_routes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_admin = os.environ.get("TADA_ADMIN_KEY")
+            previous_warmup = os.environ.get("TADA_DISABLE_WARMUP")
+            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
+            os.environ["TADA_DISABLE_WARMUP"] = "1"
+            try:
+                module = importlib.import_module("backend.server_app")
+                module.config_store = ConfigStore(Path(temp_dir))
+                admin_token = module.config_store.rotate_admin_key(label="Master")["token"]
+                module.runtime_service = FakeRuntimeService()
+                module.scheduler = FakeScheduler()
+
+                with TestClient(module.app) as client:
+                    list_response = client.get("/api/admin/keys", headers={"X-Admin-Key": admin_token})
+                    self.assertEqual(list_response.status_code, 200)
+                    self.assertEqual(list_response.json()["admin_key"]["label"], "Master")
+
+                    rotate_response = client.post("/api/admin/keys", headers={"X-Admin-Key": admin_token})
+                    self.assertEqual(rotate_response.status_code, 200)
+                    rotated_token = rotate_response.json()["key"]["token"]
+                    self.assertTrue(rotated_token.startswith("tada_admin_"))
+
+                    history_response = client.get("/api/admin/generations", headers={"X-Admin-Key": rotated_token})
+                    self.assertEqual(history_response.status_code, 200)
+                    self.assertEqual(history_response.json()["generations"][0]["generation_id"], "gen-001")
             finally:
                 if previous_admin is None:
                     os.environ.pop("TADA_ADMIN_KEY", None)
@@ -192,7 +265,7 @@ class ServerApiTests(unittest.TestCase):
             try:
                 module = importlib.import_module("backend.server_app")
                 module.config_store = ConfigStore(Path(temp_dir))
-                admin_token = module.config_store.create_key(label="Master", kind="admin")["token"]
+                admin_token = module.config_store.rotate_admin_key(label="Master")["token"]
                 module.runtime_service = FakeRuntimeService()
                 module.scheduler = FakeScheduler()
 
@@ -257,7 +330,7 @@ class ServerApiTests(unittest.TestCase):
             try:
                 module = importlib.import_module("backend.server_app")
                 module.config_store = ConfigStore(Path(temp_dir))
-                admin_token = module.config_store.create_key(label="Master", kind="admin")["token"]
+                admin_token = module.config_store.rotate_admin_key(label="Master")["token"]
                 module.runtime_service = FakeRuntimeService()
                 module.scheduler = FakeScheduler()
 

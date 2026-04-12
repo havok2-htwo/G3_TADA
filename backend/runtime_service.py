@@ -379,7 +379,9 @@ class TadaRuntimeService:
         self.project_root = project_root
         self.config_store = config_store
         self.backend_dir = project_root / "backend"
-        self.voices_dir = ensure_directory(self.backend_dir / "data" / "voices")
+        self.data_dir = ensure_directory(self.backend_dir / "data")
+        self.voices_dir = ensure_directory(self.data_dir / "voices")
+        self.generated_history_path = self.data_dir / "generated_history.jsonl"
         self.generated_dir = ensure_directory(self.backend_dir / "generated")
         self.offload_dir = ensure_directory(self.backend_dir / "offload")
         self.codec_name = os.getenv("TADA_CODEC_NAME", "HumeAI/tada-codec")
@@ -487,6 +489,28 @@ class TadaRuntimeService:
         payload = record.to_dict()
         payload["reference_url"] = f"/api/assets/voices/{record.voice_id}/reference"
         return payload
+
+    def _append_generation_history(self, payload: dict[str, Any]) -> None:
+        self.generated_history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.generated_history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+    def list_recent_generations(self, *, limit: int = 60) -> list[dict[str, Any]]:
+        if not self.generated_history_path.exists():
+            return []
+        lines = self.generated_history_path.read_text(encoding="utf-8").splitlines()
+        records: list[dict[str, Any]] = []
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+            if len(records) >= limit:
+                break
+        return records
 
     def reference_audio_path(self, voice_id: str) -> Path:
         voice = self.get_voice(voice_id)
@@ -966,10 +990,17 @@ class TadaRuntimeService:
         duration_seconds = round(float(audio.shape[-1]) / float(sample_rate), 2)
         total_wall_seconds = round(total_wall_ms / 1000.0, 2)
         rtf = round(total_wall_seconds / duration_seconds, 2) if duration_seconds > 0 else 0.0
-        return {
+        voice_name = voice_id
+        try:
+            voice_name = str(self.get_voice(voice_id).get("name") or voice_id)
+        except FileNotFoundError:
+            pass
+
+        result = {
             "generation_id": generation_id,
             "text": request_text,
             "voice_id": voice_id,
+            "voice_name": voice_name,
             "audio_url": f"/api/assets/generated/{audio_path.name}",
             "audio_file_name": audio_path.name,
             "sample_rate": sample_rate,
@@ -984,6 +1015,8 @@ class TadaRuntimeService:
             "sentence_count": sentence_count,
             "batch_count": batch_count,
         }
+        self._append_generation_history(result)
+        return result
 
     def generated_audio_path(self, file_name: str) -> Path:
         path = self.generated_dir / file_name

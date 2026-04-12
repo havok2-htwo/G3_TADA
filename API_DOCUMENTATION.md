@@ -17,15 +17,21 @@ Machine-readable schema:
 Admin routes require:
 
 - header: `X-Admin-Key: <admin token>`
+- used for all `/api/admin/...` routes
+- also required for `GET /api/assets/voices/{voice_id}/reference`
 
-Public client routes require:
+Public routes are open:
 
-- header: `X-API-Key: <client token>`
+- `GET /api/v1/voices`
+- `POST /api/v1/synthesize`
+- `POST /api/v1/synthesize/stream`
+- `GET /api/assets/generated/{file_name}`
 
-Protected asset routes accept either:
+Startup note:
 
-- `X-Admin-Key`
-- `X-API-Key`
+- `start.bat` and `start.sh` print a temporary startup admin key before the server comes up
+- `GET /api/admin/keys` shows metadata for the persistent admin key
+- `POST /api/admin/keys` rotates the persistent admin key and returns the new plaintext token once
 
 ## Common Response Rules
 
@@ -274,41 +280,30 @@ Response:
     "label": "Master Admin Key",
     "created_at": "2026-04-05T12:00:00+00:00",
     "last_used_at": null
-  },
-  "client_keys": [
-    {
-      "id": "0f7c1f4a9d0d8e6b",
-      "label": "Demo Client",
-      "created_at": "2026-04-05T12:01:00+00:00",
-      "last_used_at": null
-    }
-  ]
+  }
 }
 ```
 
 ## `POST /api/admin/keys`
-
-Request:
-
-```json
-{
-  "label": "Demo Client",
-  "kind": "client"
-}
-```
 
 Response:
 
 ```json
 {
   "key": {
-    "kind": "client",
-    "id": "0f7c1f4a9d0d8e6b",
-    "label": "Demo Client",
-    "token": "tada_client_xxx",
+    "id": "admin",
+    "label": "Master Admin Key",
+    "token": "tada_admin_xxx",
     "created_at": "2026-04-05T12:01:00+00:00"
   },
-  "keys": {}
+  "keys": {
+    "admin_key": {
+      "id": "admin",
+      "label": "Master Admin Key",
+      "created_at": "2026-04-05T12:01:00+00:00",
+      "last_used_at": null
+    }
+  }
 }
 ```
 
@@ -316,14 +311,33 @@ Important:
 
 - `token` is only returned once
 
-## `DELETE /api/admin/keys/{key_id}`
+## `GET /api/admin/generations`
 
 Response:
 
 ```json
 {
-  "ok": true,
-  "keys": {}
+  "generations": [
+    {
+      "generation_id": "20260405-180500-a1b2c3",
+      "text": "Hallo Welt. Das ist ein Test.",
+      "voice_id": "sonya-a665be06",
+      "voice_name": "SONYA",
+      "audio_url": "/api/assets/generated/20260405-180500-a1b2c3.wav",
+      "audio_file_name": "20260405-180500-a1b2c3.wav",
+      "sample_rate": 24000,
+      "duration_seconds": 2.31,
+      "processing_time": 1.94,
+      "rtf": 0.84,
+      "created_at": "2026-04-05T18:05:00+00:00",
+      "model_name": "HumeAI/tada-3b-ml",
+      "ttft_ms": 942.17,
+      "total_wall_ms": 1942.11,
+      "audio_duration_ms": 2310.0,
+      "sentence_count": 2,
+      "batch_count": 2
+    }
+  ]
 }
 ```
 
@@ -357,7 +371,7 @@ Snapshot fields:
 
 ## `GET /api/v1/voices`
 
-Returns the public voice list for authenticated client callers.
+Returns the public voice list.
 
 Example:
 
@@ -526,19 +540,13 @@ Field meaning:
 
 Returns the generated WAV file.
 
-Requires:
-
-- `X-Admin-Key`, or
-- `X-API-Key`
-
 ## `GET /api/assets/voices/{voice_id}/reference`
 
 Returns the stored reference WAV for a voice.
 
 Requires:
 
-- `X-Admin-Key`, or
-- `X-API-Key`
+- `X-Admin-Key`
 
 ## Minimal cURL Examples
 
@@ -547,7 +555,6 @@ Create a blocking synthesis request:
 ```bash
 curl -X POST "http://127.0.0.1:7878/api/v1/synthesize" \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: tada_client_xxx" \
   -d "{\"text\":\"Hallo Welt.\",\"voice_id\":\"sonya-a665be06\"}"
 ```
 
@@ -556,7 +563,6 @@ Start an NDJSON stream:
 ```bash
 curl -N -X POST "http://127.0.0.1:7878/api/v1/synthesize/stream" \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: tada_client_xxx" \
   -d "{\"text\":\"Hallo Welt.\",\"voice_id\":\"sonya-a665be06\"}"
 ```
 

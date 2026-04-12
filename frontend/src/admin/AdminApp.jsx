@@ -3,7 +3,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { apiFetch, formatDate, formatMs, formatSeconds, loadProtectedAudioUrl } from "../shared/api";
 
 const ADMIN_KEY_STORAGE = "tada_admin_key";
-const CLIENT_KEY_TOKENS_STORAGE = "tada_client_key_tokens";
 const MIN_REFERENCE_SECONDS = 3;
 const MAX_REFERENCE_SECONDS = 14.5;
 const DEFAULT_REFERENCE_SECONDS = 10;
@@ -194,36 +193,6 @@ function clearStoredAdminKey() {
   } catch {}
 }
 
-function readStoredClientKeyTokens() {
-  try {
-    const raw = localStorage.getItem(CLIENT_KEY_TOKENS_STORAGE) || sessionStorage.getItem(CLIENT_KEY_TOKENS_STORAGE) || "{}";
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-    return Object.fromEntries(
-      Object.entries(parsed).filter(([keyId, token]) => keyId && typeof token === "string" && token),
-    );
-  } catch {
-    return {};
-  }
-}
-
-function writeStoredClientKeyTokens(tokensById) {
-  try {
-    const serialized = JSON.stringify(tokensById || {});
-    localStorage.setItem(CLIENT_KEY_TOKENS_STORAGE, serialized);
-    sessionStorage.setItem(CLIENT_KEY_TOKENS_STORAGE, serialized);
-  } catch {}
-}
-
-function pruneStoredClientKeyTokens(tokensById, clientKeys) {
-  const validIds = new Set((clientKeys || []).map((item) => item.id));
-  return Object.fromEntries(
-    Object.entries(tokensById || {}).filter(([keyId, token]) => validIds.has(keyId) && typeof token === "string" && token),
-  );
-}
-
 async function copyTextToClipboard(value) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value);
@@ -280,7 +249,8 @@ export default function AdminApp() {
   const [modelSnapshot, setModelSnapshot] = useState([]);
   const [voices, setVoices] = useState([]);
   const [languages, setLanguages] = useState({});
-  const [keys, setKeys] = useState({ admin_key: null, client_keys: [] });
+  const [keys, setKeys] = useState({ admin_key: null });
+  const [generations, setGenerations] = useState([]);
   const [dashboard, setDashboard] = useState(null);
   const [voiceForm, setVoiceForm] = useState(initialVoiceForm);
   const [voicePreview, setVoicePreview] = useState(EMPTY_VOICE_PREVIEW);
@@ -288,8 +258,6 @@ export default function AdminApp() {
   const [viewportStartMs, setViewportStartMs] = useState(0);
   const [isLoopingPreview, setIsLoopingPreview] = useState(false);
   const [loopPlayheadMs, setLoopPlayheadMs] = useState(0);
-  const [newKeyLabel, setNewKeyLabel] = useState("");
-  const [storedClientKeyTokens, setStoredClientKeyTokens] = useState(() => readStoredClientKeyTokens());
   const [newlyCreatedKey, setNewlyCreatedKey] = useState(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -589,10 +557,11 @@ export default function AdminApp() {
       return;
     }
     setError("");
-    const [settingsData, voicesData, keysData] = await Promise.all([
+    const [settingsData, voicesData, keysData, generationsData] = await Promise.all([
       apiFetch("/api/admin/settings", { adminKey }),
       apiFetch("/api/admin/voices", { adminKey }),
       apiFetch("/api/admin/keys", { adminKey }),
+      apiFetch("/api/admin/generations", { adminKey }),
     ]);
     setSettingsSnapshot(settingsData.settings);
     setRuntimeSnapshot(settingsData.runtime);
@@ -600,11 +569,7 @@ export default function AdminApp() {
     setVoices(voicesData.voices || []);
     setLanguages(voicesData.languages || {});
     setKeys(keysData);
-    setStoredClientKeyTokens((current) => {
-      const next = pruneStoredClientKeyTokens(current, keysData.client_keys || []);
-      writeStoredClientKeyTokens(next);
-      return next;
-    });
+    setGenerations(generationsData.generations || []);
   }
 
   useEffect(() => {
@@ -638,7 +603,8 @@ export default function AdminApp() {
     setModelSnapshot([]);
     setVoices([]);
     setLanguages({});
-    setKeys({ admin_key: null, client_keys: [] });
+    setKeys({ admin_key: null });
+    setGenerations([]);
     setDashboard(null);
     setVoicePreview(EMPTY_VOICE_PREVIEW);
     if (nextMessage) {
@@ -866,28 +832,19 @@ export default function AdminApp() {
     }
   }
 
-  async function handleCreateKey(kind) {
+  async function handleRotateAdminKey() {
     setError("");
     try {
       const data = await apiFetch("/api/admin/keys", {
         method: "POST",
         adminKey,
-        body: { label: newKeyLabel, kind },
       });
       setKeys(data.keys);
       setNewlyCreatedKey(data.key);
-      if (kind === "client" && data.key?.id && data.key?.token) {
-        setStoredClientKeyTokens((current) => {
-          const next = { ...current, [data.key.id]: data.key.token };
-          writeStoredClientKeyTokens(next);
-          return next;
-        });
-      }
-      if (kind === "admin" && data.key?.token) {
+      if (data.key?.token) {
         persistAdminKey(data.key.token);
       }
-      setNewKeyLabel("");
-      setMessage(kind === "admin" ? "Admin key rotated." : "Client key created.");
+      setMessage("Admin key rotated.");
     } catch (keyError) {
       if (isUnauthorizedError(keyError)) {
         clearPersistedAdminKey({
@@ -897,33 +854,6 @@ export default function AdminApp() {
         return;
       }
       setError(keyError.message);
-    }
-  }
-
-  async function handleDeleteKey(keyId) {
-    setError("");
-    try {
-      const data = await apiFetch(`/api/admin/keys/${keyId}`, {
-        method: "DELETE",
-        adminKey,
-      });
-      setKeys(data.keys);
-      setStoredClientKeyTokens((current) => {
-        const next = { ...current };
-        delete next[keyId];
-        writeStoredClientKeyTokens(next);
-        return next;
-      });
-      setMessage("Client key deleted.");
-    } catch (deleteError) {
-      if (isUnauthorizedError(deleteError)) {
-        clearPersistedAdminKey({
-          nextMessage: "Your admin key is no longer valid. Please sign in again.",
-          keepInputValue: adminKey,
-        });
-        return;
-      }
-      setError(deleteError.message);
     }
   }
 
@@ -980,9 +910,9 @@ export default function AdminApp() {
     return (
       <main className="auth-shell">
         <section className="panel stack">
-          <p className="eyebrow">Admin Login</p>
+          <p className="eyebrow">Private Access</p>
           <h1>TADA Admin</h1>
-          <p className="muted">Enter the master admin key printed by the server or generated in the key section.</p>
+          <p className="muted">The public generation API stays open. The dashboard is protected by the master admin key and the temporary startup key shown during launch.</p>
           <input value={adminKeyInput} onChange={(event) => setAdminKeyInput(event.target.value)} placeholder="tada_admin_..." />
           <div className="button-row">
             <button type="button" onClick={() => handleOpenAdmin()} disabled={!adminKeyInput.trim()}>
@@ -998,14 +928,17 @@ export default function AdminApp() {
     <main className="page-shell">
       <section className="hero">
         <div>
-          <p className="eyebrow">Batch TTS Admin</p>
-          <h1>TADA Server Control</h1>
+          <p className="eyebrow">Powered by SONS</p>
+          <h1>G3 TADA Admin</h1>
           <p className="hero-copy">
-            Manage runtime settings, model downloads, voices, API keys and the live scheduler dashboard.
+            Manage runtime settings, model downloads, voices, the admin-key workflow and the live scheduler dashboard.
           </p>
           <div className="button-row" style={{ marginTop: 16 }}>
             <button type="button" className="secondary" onClick={() => loadAll().catch((loadError) => setError(loadError.message))}>
               Refresh
+            </button>
+            <button type="button" className="secondary" onClick={() => handleRotateAdminKey()}>
+              Rotate Admin Key
             </button>
             <button
               type="button"
@@ -1045,11 +978,11 @@ export default function AdminApp() {
             <h3>Current Batch</h3>
             {dashboard?.current_batch ? (
               <div className="list">
-                <div className="muted mono">#{dashboard.current_batch.batch_id} · {dashboard.current_batch.size} items</div>
+                <div className="muted mono">#{dashboard.current_batch.batch_id} | {dashboard.current_batch.size} items</div>
                 {dashboard.current_batch.items.map((item) => (
                   <div key={`${item.request_id}-${item.sentence_index}`} className="card">
                     <strong>{item.request_id}</strong>
-                    <div className="muted">{item.voice_id} · sentence {item.sentence_index + 1}</div>
+                    <div className="muted">{item.voice_id} | sentence {item.sentence_index + 1}</div>
                     <div>{item.text_preview}</div>
                   </div>
                 ))}
@@ -1107,30 +1040,32 @@ export default function AdminApp() {
         </section>
 
         <section className="panel stack full-span">
-          <p className="eyebrow">API Keys</p>
-          <h2>Access Control</h2>
+          <p className="eyebrow">Admin Key</p>
+          <h2>Dashboard Access</h2>
           {newlyCreatedKey ? (
             <div className="card stack compact">
               <div className="card-header">
                 <div className="stack compact">
                   <strong>{newlyCreatedKey.label}</strong>
-                  <span className="muted">{newlyCreatedKey.kind === "admin" ? "Admin Key" : "Client Key"}</span>
+                  <span className="muted">Admin Key</span>
                 </div>
                 <button type="button" className="secondary" onClick={() => handleCopyKey(newlyCreatedKey.token, newlyCreatedKey.label)}>
                   Copy
                 </button>
               </div>
               <div className="mono key-token-value">{newlyCreatedKey.token}</div>
-              <div className="muted">The server returns this token only once. Keys created in this browser stay copyable from the overview below.</div>
+              <div className="muted">The server returns this token only once and the browser switches to it immediately.</div>
             </div>
           ) : null}
-          <div className="stack">
-            <label>Key Name<input value={newKeyLabel} onChange={(event) => setNewKeyLabel(event.target.value)} placeholder="e.g. Home Assistant, Node-RED, Demo Tablet" /></label>
-            <p className="muted">The name is shown in the overview so you can see which key belongs to which system.</p>
-            <div className="button-row">
-              <button type="button" onClick={() => handleCreateKey("client")}>Create Client Key</button>
-              <button type="button" className="ghost" onClick={() => handleCreateKey("admin")}>Rotate Admin Key</button>
-            </div>
+          <div className="metric-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+            <div className="metric-card"><span>Name</span><strong>{keys.admin_key?.label || "Master Admin Key"}</strong></div>
+            <div className="metric-card"><span>Created</span><strong>{formatCompactDate(keys.admin_key?.created_at)}</strong></div>
+            <div className="metric-card"><span>Last Used</span><strong>{formatCompactDate(keys.admin_key?.last_used_at)}</strong></div>
+            <div className="metric-card"><span>Browser Token</span><strong>{adminKey ? "stored" : "missing"}</strong></div>
+          </div>
+          <div className="button-row">
+            <button type="button" onClick={() => handleRotateAdminKey()}>Rotate Admin Key</button>
+            <button type="button" className="secondary" onClick={() => handleCopyKey(adminKey, keys.admin_key?.label || "Master Admin Key")}>Copy Current Key</button>
           </div>
           <div className="table-wrap">
             <table className="table keys-table">
@@ -1154,29 +1089,6 @@ export default function AdminApp() {
                     </td>
                   </tr>
                 ) : null}
-                {(keys.client_keys || []).map((item) => (
-                  <tr key={item.id}>
-                    <td>Client</td>
-                    <td>{item.label}</td>
-                    <td className="key-token-cell">
-                      {storedClientKeyTokens[item.id] ? (
-                        <div className="mono key-token-value">{storedClientKeyTokens[item.id]}</div>
-                      ) : (
-                        <div className="muted key-token-missing">Not available in this browser anymore. Create a new key here if you need to copy it again.</div>
-                      )}
-                    </td>
-                    <td className="date-cell">{formatCompactDate(item.created_at)}</td>
-                    <td className="date-cell">{formatCompactDate(item.last_used_at)}</td>
-                    <td className="action-cell">
-                      <div className="button-row compact">
-                        <button type="button" className="secondary" onClick={() => handleCopyKey(storedClientKeyTokens[item.id], item.label)} disabled={!storedClientKeyTokens[item.id]}>
-                          Copy
-                        </button>
-                        <button type="button" className="ghost" onClick={() => handleDeleteKey(item.id)}>Delete</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
               </tbody>
             </table>
           </div>
@@ -1184,6 +1096,53 @@ export default function AdminApp() {
       </section>
 
       <section className="panel-grid">
+        <section className="panel stack full-span">
+          <p className="eyebrow">History</p>
+          <h2>Latest Generations</h2>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Voice</th>
+                  <th>Text</th>
+                  <th>Audio</th>
+                  <th>TTFT</th>
+                  <th>Total</th>
+                  <th>Batches</th>
+                  <th>Output</th>
+                </tr>
+              </thead>
+              <tbody>
+                {generations.length > 0 ? (
+                  generations.map((item) => (
+                    <tr key={item.generation_id}>
+                      <td className="date-cell">{formatCompactDate(item.created_at)}</td>
+                      <td>{item.voice_name || item.voice_id || "-"}</td>
+                      <td>{item.text || "-"}</td>
+                      <td>{formatSeconds(item.duration_seconds)}</td>
+                      <td>{formatMs(item.ttft_ms)}</td>
+                      <td>{formatMs(item.total_wall_ms)}</td>
+                      <td>{item.batch_count ?? "-"}</td>
+                      <td className="action-cell">
+                        {item.audio_url ? (
+                          <button type="button" className="secondary" onClick={() => window.open(item.audio_url, "_blank", "noopener,noreferrer")}>
+                            Open WAV
+                          </button>
+                        ) : "-"}
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={8}>No generation history has been recorded yet.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <section className="panel stack">
           <p className="eyebrow">Voices</p>
           <h2>Create Voice</h2>
