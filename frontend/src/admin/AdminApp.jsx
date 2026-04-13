@@ -7,6 +7,33 @@ const MIN_REFERENCE_SECONDS = 3;
 const MAX_REFERENCE_SECONDS = 14.5;
 const DEFAULT_REFERENCE_SECONDS = 10;
 const REFERENCE_TAIL_SILENCE_SECONDS = 0.5;
+const GRAPH_HISTORY_SECONDS = 60;
+const GRAPH_REFRESH_SECONDS = 0.5;
+const GRAPH_HISTORY_POINTS = Math.round(GRAPH_HISTORY_SECONDS / GRAPH_REFRESH_SECONDS);
+const FALLBACK_AVAILABLE_MODELS = [
+  {
+    id: "HumeAI/tada-3b-ml",
+    label: "TADA 3B ML",
+    description: "Beste Qualitaet, aber am langsamsten.",
+  },
+  {
+    id: "HumeAI/tada-1b",
+    label: "TADA 1B",
+    description: "Leichter und besser fuer Speed/8 GB VRAM.",
+  },
+];
+const FALLBACK_LANGUAGES = {
+  en: "English",
+  ar: "Arabic",
+  ch: "Chinese",
+  de: "German",
+  es: "Spanish",
+  fr: "French",
+  it: "Italian",
+  ja: "Japanese",
+  pl: "Polish",
+  pt: "Portuguese",
+};
 
 const initialVoiceForm = {
   name: "",
@@ -171,6 +198,59 @@ function formatCompactDate(value) {
   }).format(new Date(value));
 }
 
+function formatRealtimeFactor(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) {
+    return "-";
+  }
+  if (number === 0) {
+    return "0x";
+  }
+  if (number >= 10) {
+    return `${number.toFixed(0)}x`;
+  }
+  if (number >= 1) {
+    return `${number.toFixed(1)}x`;
+  }
+  return `${number.toFixed(2)}x`;
+}
+
+function computeNiceScaleMax(value) {
+  const safeValue = Math.max(1, Number(value || 0));
+  const magnitude = 10 ** Math.floor(Math.log10(safeValue));
+  const normalized = safeValue / magnitude;
+  if (normalized <= 1) {
+    return 1 * magnitude;
+  }
+  if (normalized <= 2) {
+    return 2 * magnitude;
+  }
+  if (normalized <= 5) {
+    return 5 * magnitude;
+  }
+  return 10 * magnitude;
+}
+
+function computeBatchScaleMax(value) {
+  const safeValue = Math.max(1, Math.ceil(Number(value || 0)));
+  if (safeValue <= 4) {
+    return 4;
+  }
+  if (safeValue <= 8) {
+    return 8;
+  }
+  if (safeValue <= 16) {
+    return 16;
+  }
+  if (safeValue <= 32) {
+    return 32;
+  }
+  if (safeValue <= 64) {
+    return 64;
+  }
+  return Math.ceil(safeValue / 32) * 32;
+}
+
 function readStoredAdminKey() {
   try {
     return localStorage.getItem(ADMIN_KEY_STORAGE) || sessionStorage.getItem(ADMIN_KEY_STORAGE) || "";
@@ -211,34 +291,122 @@ async function copyTextToClipboard(value) {
   document.body.removeChild(textArea);
 }
 
+function downloadJsonFile(fileName, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
+async function readJsonFile(file) {
+  const text = await file.text();
+  return JSON.parse(text);
+}
+
 function isUnauthorizedError(error) {
   return Number(error?.status) === 401;
+}
+
+function isMissingPresetSupportError(error) {
+  const status = Number(error?.status);
+  return status === 404 || status === 405;
 }
 
 function isVoiceConflictError(error) {
   return Number(error?.status) === 409 && error?.payload?.code === "voice_name_exists";
 }
 
-function Sparkline({ history, metricKey, color }) {
-  const points = history.slice(-60).map((item) => Number(item?.[metricKey] || 0));
-  const max = Math.max(1, ...points);
-  const min = Math.min(0, ...points);
-  const width = 100;
-  const height = 40;
-  const span = Math.max(1, max - min);
+function Sparkline({ history, metricKey, color, batchMetricKey = null, batchColor = "#ffb347", batchScaleHint = 1 }) {
+  const visibleHistory = history.slice(-GRAPH_HISTORY_POINTS);
+  const points = visibleHistory.map((item) => Number(item?.[metricKey] || 0));
+  const batchPoints = batchMetricKey ? visibleHistory.map((item) => Number(item?.[batchMetricKey] || 0)) : [];
+  const currentValue = points.length > 0 ? points[points.length - 1] : 0;
+  const currentBatchValue = batchPoints.length > 0 ? batchPoints[batchPoints.length - 1] : 0;
+  const scaleMax = computeNiceScaleMax(Math.max(1, ...points));
+  const batchScaleMax = computeBatchScaleMax(Math.max(batchScaleHint || 1, ...batchPoints, 1));
+  const width = 160;
+  const height = 228;
+  const leftPad = 42;
+  const rightPad = batchMetricKey ? 42 : 10;
+  const topPad = 12;
+  const bottomPad = 26;
+  const chartWidth = width - leftPad - rightPad;
+  const chartHeight = height - topPad - bottomPad;
+  const tickValues = [scaleMax, scaleMax * 0.75, scaleMax * 0.5, scaleMax * 0.25, 0];
+  const batchTickValues = batchMetricKey ? [batchScaleMax, batchScaleMax * 0.75, batchScaleMax * 0.5, batchScaleMax * 0.25, 0] : [];
+  const getY = (value) => topPad + chartHeight - (Math.max(0, value) / scaleMax) * chartHeight;
+  const getBatchY = (value) => topPad + chartHeight - (Math.max(0, value) / batchScaleMax) * chartHeight;
   const path = points
     .map((value, index) => {
-      const x = points.length <= 1 ? 0 : (index / (points.length - 1)) * width;
-      const y = height - ((value - min) / span) * height;
+      const x = leftPad + (points.length <= 1 ? 0 : (index / (points.length - 1)) * chartWidth);
+      const y = getY(value);
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+  const batchPath = batchPoints
+    .map((value, index) => {
+      const x = leftPad + (batchPoints.length <= 1 ? 0 : (index / (batchPoints.length - 1)) * chartWidth);
+      const y = getBatchY(value);
       return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
     })
     .join(" ");
 
   return (
-    <svg className="graph" viewBox="0 0 100 40" preserveAspectRatio="none">
-      <path d={path} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
-    </svg>
+    <div className="sparkline-shell">
+      <svg className="graph" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-label="Realtime factor history">
+        {tickValues.map((tickValue) => {
+          const y = getY(tickValue);
+          return (
+            <g key={tickValue}>
+              <line x1={leftPad} y1={y} x2={width - rightPad} y2={y} className="graph-grid-line" />
+              <text x={leftPad - 6} y={y + 3} textAnchor="end" className="graph-axis-label">
+                {formatRealtimeFactor(tickValue)}
+              </text>
+            </g>
+          );
+        })}
+        {batchTickValues.map((tickValue) => {
+          const y = getBatchY(tickValue);
+          return (
+            <g key={`batch-${tickValue}`}>
+              <text x={width - rightPad + 6} y={y + 3} textAnchor="start" className="graph-axis-label graph-axis-label-batch">
+                {Math.round(tickValue)}
+              </text>
+            </g>
+          );
+        })}
+        {scaleMax >= 1 ? (
+          <line
+            x1={leftPad}
+            y1={getY(1)}
+            x2={width - rightPad}
+            y2={getY(1)}
+            className="graph-reference-line"
+          />
+        ) : null}
+        {batchPath ? <path d={batchPath} fill="none" stroke={batchColor} strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" opacity="0.5" /> : null}
+        {path ? <path d={path} fill="none" stroke={color} strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" opacity="0.5" /> : null}
+        <text x={leftPad} y={height - 4} textAnchor="start" className="graph-timeline-label">-{GRAPH_HISTORY_SECONDS}s</text>
+        <text x={width - rightPad} y={height - 4} textAnchor="end" className="graph-timeline-label">now</text>
+      </svg>
+      <div className="graph-caption">
+        <span className="graph-legend">
+          <span className="graph-legend-item"><span className="graph-legend-dot" style={{ backgroundColor: color }} />Realtime factor</span>
+          {batchMetricKey ? <span className="graph-legend-item"><span className="graph-legend-dot" style={{ backgroundColor: batchColor }} />Current batch size</span> : null}
+        </span>
+        <strong>{formatRealtimeFactor(currentValue)} | {Math.round(currentBatchValue)}</strong>
+      </div>
+    </div>
   );
+}
+
+function InfoTip({ text }) {
+  return <span className="info-tip" data-tooltip={text}>i</span>;
 }
 
 export default function AdminApp() {
@@ -251,6 +419,7 @@ export default function AdminApp() {
   const [languages, setLanguages] = useState({});
   const [keys, setKeys] = useState({ admin_key: null });
   const [generations, setGenerations] = useState([]);
+  const [settingsPresets, setSettingsPresets] = useState([]);
   const [dashboard, setDashboard] = useState(null);
   const [voiceForm, setVoiceForm] = useState(initialVoiceForm);
   const [voicePreview, setVoicePreview] = useState(EMPTY_VOICE_PREVIEW);
@@ -262,6 +431,8 @@ export default function AdminApp() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [selectedPresetName, setSelectedPresetName] = useState("");
+  const [newPresetName, setNewPresetName] = useState("");
   const [voiceAudioUrls, setVoiceAudioUrls] = useState({});
   const dashboardAbortRef = useRef(null);
   const trimLoopAudioRef = useRef(null);
@@ -291,6 +462,9 @@ export default function AdminApp() {
   const settingsForm = useMemo(
     () => ({
       active_model: settingsSnapshot?.active_model || "HumeAI/tada-3b-ml",
+      model_precision: settingsSnapshot?.model_precision || "fp16",
+      deterministic_seed: settingsSnapshot?.deterministic_seed ?? "",
+      persist_generated_wavs: settingsSnapshot?.persist_generated_wavs ?? false,
       steps: settingsSnapshot?.steps || 10,
       sentence_chunking: settingsSnapshot?.sentence_chunking ?? true,
       short_sentence_merge_max_chars: settingsSnapshot?.short_sentence_merge_max_chars ?? 30,
@@ -304,9 +478,45 @@ export default function AdminApp() {
       max_queue_size: settingsSnapshot?.max_queue_size || 256,
       model_storage_path: settingsSnapshot?.model_storage_path || "",
       whisper_base_url: settingsSnapshot?.whisper_base_url || "",
+      vad_trimming: settingsSnapshot?.vad_trimming ?? true,
+      prompt_start_trim_steps: settingsSnapshot?.prompt_start_trim_steps ?? 0,
+      vad_threshold_pct: settingsSnapshot?.vad_threshold_pct ?? 0.015,
+      vad_padding_ms: settingsSnapshot?.vad_padding_ms ?? 150,
+      vad_fade_ms: settingsSnapshot?.vad_fade_ms ?? 50,
     }),
     [settingsSnapshot],
   );
+
+  const availableModelOptions = useMemo(() => {
+    const merged = new Map();
+    for (const model of FALLBACK_AVAILABLE_MODELS) {
+      merged.set(model.id, model);
+    }
+    for (const model of runtimeSnapshot?.available_models || []) {
+      if (model?.id) {
+        merged.set(model.id, model);
+      }
+    }
+    const currentModelId = settingsSnapshot?.active_model || settingsForm.active_model;
+    if (currentModelId && !merged.has(currentModelId)) {
+      merged.set(currentModelId, {
+        id: currentModelId,
+        label: currentModelId,
+        description: "",
+      });
+    }
+    return Array.from(merged.values());
+  }, [runtimeSnapshot, settingsSnapshot, settingsForm.active_model]);
+
+  const availableLanguages = useMemo(() => {
+    if (languages && Object.keys(languages).length > 0) {
+      return languages;
+    }
+    if (runtimeSnapshot?.languages && Object.keys(runtimeSnapshot.languages).length > 0) {
+      return runtimeSnapshot.languages;
+    }
+    return FALLBACK_LANGUAGES;
+  }, [languages, runtimeSnapshot]);
 
   const [draftSettings, setDraftSettings] = useState(settingsForm);
 
@@ -552,24 +762,84 @@ export default function AdminApp() {
     };
   }, [adminKey]);
 
+  async function loadVoiceLibrary() {
+    try {
+      const payload = await apiFetch("/api/admin/voices", { adminKey });
+      return {
+        voices: payload.voices || [],
+        languages: payload.languages || {},
+        usedFallback: false,
+      };
+    } catch (voiceError) {
+      if (isUnauthorizedError(voiceError)) {
+        throw voiceError;
+      }
+      console.warn("Admin voice library load failed, falling back to public voice list.", voiceError);
+      const publicPayload = await apiFetch("/api/v1/voices");
+      return {
+        voices: publicPayload.voices || [],
+        languages: {},
+        usedFallback: true,
+      };
+    }
+  }
+
   async function loadAll() {
     if (!adminKey) {
       return;
     }
     setError("");
-    const [settingsData, voicesData, keysData, generationsData] = await Promise.all([
+    const [settingsResult, voicesResult, keysResult, generationsResult, presetsResult] = await Promise.allSettled([
       apiFetch("/api/admin/settings", { adminKey }),
-      apiFetch("/api/admin/voices", { adminKey }),
+      loadVoiceLibrary(),
       apiFetch("/api/admin/keys", { adminKey }),
       apiFetch("/api/admin/generations", { adminKey }),
+      apiFetch("/api/admin/settings/presets", { adminKey }),
     ]);
+
+    const unauthorizedFailure = [settingsResult, voicesResult, keysResult, generationsResult, presetsResult]
+      .find((result) => result.status === "rejected" && isUnauthorizedError(result.reason));
+    if (unauthorizedFailure) {
+      throw unauthorizedFailure.reason;
+    }
+    if (settingsResult.status === "rejected") {
+      throw settingsResult.reason;
+    }
+
+    const settingsData = settingsResult.value;
     setSettingsSnapshot(settingsData.settings);
     setRuntimeSnapshot(settingsData.runtime);
     setModelSnapshot(settingsData.models || []);
-    setVoices(voicesData.voices || []);
-    setLanguages(voicesData.languages || {});
-    setKeys(keysData);
-    setGenerations(generationsData.generations || []);
+
+    if (voicesResult.status === "fulfilled") {
+      setVoices(voicesResult.value.voices || []);
+      setLanguages(
+        voicesResult.value.languages
+        || settingsData.runtime?.languages
+        || FALLBACK_LANGUAGES,
+      );
+    } else {
+      console.warn("Voice library load failed.", voicesResult.reason);
+      setVoices([]);
+      setLanguages(settingsData.runtime?.languages || FALLBACK_LANGUAGES);
+    }
+
+    if (keysResult.status === "fulfilled") {
+      setKeys(keysResult.value);
+    }
+    if (generationsResult.status === "fulfilled") {
+      setGenerations(generationsResult.value.generations || []);
+    }
+    if (presetsResult.status === "fulfilled") {
+      setSettingsPresets(presetsResult.value.presets || settingsData.presets || []);
+    } else {
+      setSettingsPresets(settingsData.presets || []);
+      if (isMissingPresetSupportError(presetsResult.reason)) {
+        console.warn("Preset routes are not active on the running backend yet. Restart required.");
+      } else {
+        console.warn("Settings preset load failed.", presetsResult.reason);
+      }
+    }
   }
 
   useEffect(() => {
@@ -605,6 +875,9 @@ export default function AdminApp() {
     setLanguages({});
     setKeys({ admin_key: null });
     setGenerations([]);
+    setSettingsPresets([]);
+    setSelectedPresetName("");
+    setNewPresetName("");
     setDashboard(null);
     setVoicePreview(EMPTY_VOICE_PREVIEW);
     if (nextMessage) {
@@ -635,14 +908,19 @@ export default function AdminApp() {
     setMessage("");
     setError("");
     try {
+      const settingsPayload = {
+        ...draftSettings,
+        deterministic_seed: draftSettings.deterministic_seed === "" ? null : Number(draftSettings.deterministic_seed),
+      };
       const data = await apiFetch("/api/admin/settings", {
         method: "PUT",
         adminKey,
-        body: draftSettings,
+        body: settingsPayload,
       });
       setSettingsSnapshot(data.settings);
       setRuntimeSnapshot(data.runtime);
       setModelSnapshot(data.models || []);
+      setSettingsPresets(data.presets || []);
       setMessage(data.settings.restart_required ? "Settings saved. Restart required for startup-level changes." : "Settings saved.");
     } catch (submitError) {
       if (isUnauthorizedError(submitError)) {
@@ -653,6 +931,137 @@ export default function AdminApp() {
         return;
       }
       setError(submitError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function handleExportSettings() {
+    if (!settingsSnapshot) {
+      setError("No settings are loaded yet.");
+      return;
+    }
+    const exportedAt = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadJsonFile(`tada-settings-${exportedAt}.json`, {
+      exported_at: new Date().toISOString(),
+      settings: settingsSnapshot,
+    });
+    setMessage("Settings exported as JSON.");
+    setError("");
+  }
+
+  async function handleImportSettingsFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+    setSaving(true);
+    setMessage("");
+    setError("");
+    try {
+      const imported = await readJsonFile(file);
+      const importedSettings = imported?.settings && typeof imported.settings === "object" ? imported.settings : imported;
+      const settingsPayload = {
+        ...importedSettings,
+        deterministic_seed:
+          importedSettings?.deterministic_seed === "" || importedSettings?.deterministic_seed === undefined
+            ? null
+            : importedSettings?.deterministic_seed,
+      };
+      const data = await apiFetch("/api/admin/settings", {
+        method: "PUT",
+        adminKey,
+        body: settingsPayload,
+      });
+      setSettingsSnapshot(data.settings);
+      setRuntimeSnapshot(data.runtime);
+      setModelSnapshot(data.models || []);
+      setSettingsPresets(data.presets || []);
+      setMessage("Settings imported.");
+    } catch (importError) {
+      if (isUnauthorizedError(importError)) {
+        clearPersistedAdminKey({
+          nextMessage: "Your admin key is no longer valid. Please sign in again.",
+          keepInputValue: adminKey,
+        });
+        return;
+      }
+      setError(importError.message || "The selected JSON file could not be imported.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleSavePreset() {
+    const label = newPresetName.trim();
+    if (!label) {
+      setError("Please enter a preset name first.");
+      return;
+    }
+    setSaving(true);
+    setMessage("");
+    setError("");
+    try {
+      const data = await apiFetch("/api/admin/settings/presets/save", {
+        method: "POST",
+        adminKey,
+        body: { name: label },
+      });
+      setSettingsPresets(data.presets || []);
+      setNewPresetName("");
+      setSelectedPresetName(data.preset?.name || "");
+      setMessage(`Preset "${data.preset?.label || label}" saved.`);
+    } catch (presetError) {
+      if (isUnauthorizedError(presetError)) {
+        clearPersistedAdminKey({
+          nextMessage: "Your admin key is no longer valid. Please sign in again.",
+          keepInputValue: adminKey,
+        });
+        return;
+      }
+      if (isMissingPresetSupportError(presetError)) {
+        setError("Preset routes are not active on the running backend yet. Please restart the TADA server once.");
+        return;
+      }
+      setError(presetError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleApplyPreset() {
+    if (!selectedPresetName) {
+      setError("Please select a preset first.");
+      return;
+    }
+    setSaving(true);
+    setMessage("");
+    setError("");
+    try {
+      const data = await apiFetch("/api/admin/settings/presets/apply", {
+        method: "POST",
+        adminKey,
+        body: { name: selectedPresetName },
+      });
+      setSettingsSnapshot(data.settings);
+      setRuntimeSnapshot(data.runtime);
+      setModelSnapshot(data.models || []);
+      setSettingsPresets(data.presets || []);
+      setMessage(`Preset "${selectedPresetName}" applied.`);
+    } catch (presetError) {
+      if (isUnauthorizedError(presetError)) {
+        clearPersistedAdminKey({
+          nextMessage: "Your admin key is no longer valid. Please sign in again.",
+          keepInputValue: adminKey,
+        });
+        return;
+      }
+      if (isMissingPresetSupportError(presetError)) {
+        setError("Preset routes are not active on the running backend yet. Please restart the TADA server once.");
+        return;
+      }
+      setError(presetError.message);
     } finally {
       setSaving(false);
     }
@@ -942,6 +1351,15 @@ export default function AdminApp() {
             </button>
             <button
               type="button"
+              className="secondary"
+              onClick={() => {
+                window.open("/docs", "_blank", "noopener,noreferrer");
+              }}
+            >
+              OpenAPI / Docs
+            </button>
+            <button
+              type="button"
               className="ghost"
               onClick={() => {
                 clearPersistedAdminKey();
@@ -969,16 +1387,25 @@ export default function AdminApp() {
           <h2>Live Queue</h2>
           <div className="metric-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}>
             <div className="metric-card"><span>Queue</span><strong>{dashboard?.queue_length ?? 0}</strong></div>
+            <div className="metric-card"><span>Queued Sentences</span><strong>{dashboard?.queued_sentence_count ?? 0}</strong></div>
             <div className="metric-card"><span>Active</span><strong>{dashboard?.active_request_count ?? 0}</strong></div>
             <div className="metric-card"><span>Mean TTFT</span><strong>{formatMs(dashboard?.mean_ttft_ms)}</strong></div>
-            <div className="metric-card"><span>Audio/s</span><strong>{dashboard?.throughput_audio_sps ?? 0}</strong></div>
+            <div className="metric-card"><span>Realtime</span><strong>{formatRealtimeFactor(dashboard?.throughput_audio_sps ?? 0)}</strong></div>
+            <div className="metric-card"><span>Current Batch</span><strong>{dashboard?.current_batch?.size ?? 0} / {settingsSnapshot?.max_batch_size ?? "-"}</strong></div>
           </div>
-          <Sparkline history={dashboard?.history || []} metricKey="throughput_audio_sps" color="#0e7af6" />
+          <Sparkline
+            history={dashboard?.history || []}
+            metricKey="throughput_audio_sps"
+            color="#0e7af6"
+            batchMetricKey="batch_size"
+            batchColor="#ffb347"
+            batchScaleHint={settingsSnapshot?.max_batch_size ?? 1}
+          />
           <div className="card">
             <h3>Current Batch</h3>
             {dashboard?.current_batch ? (
               <div className="list">
-                <div className="muted mono">#{dashboard.current_batch.batch_id} | {dashboard.current_batch.size} items</div>
+                <div className="muted mono">#{dashboard.current_batch.batch_id} | {dashboard.current_batch.size} items | voice {dashboard.current_batch.voice_id || "-"}</div>
                 {dashboard.current_batch.items.map((item) => (
                   <div key={`${item.request_id}-${item.sentence_index}`} className="card">
                     <strong>{item.request_id}</strong>
@@ -994,25 +1421,84 @@ export default function AdminApp() {
         <section className="panel stack">
           <p className="eyebrow">Settings</p>
           <h2>Runtime Config</h2>
+          <div className="card stack compact">
+            <div className="preset-toolbar">
+              <label>
+                Preset
+                <select value={selectedPresetName} onChange={(event) => setSelectedPresetName(event.target.value)}>
+                  <option value="">Select preset...</option>
+                  {settingsPresets.map((preset) => (
+                    <option key={preset.name} value={preset.name}>{preset.label}</option>
+                  ))}
+                </select>
+              </label>
+              <button type="button" className="secondary" onClick={handleApplyPreset} disabled={saving || !selectedPresetName}>
+                Apply Preset
+              </button>
+            </div>
+            <div className="preset-toolbar">
+              <label>
+                Save Current As
+                <input
+                  value={newPresetName}
+                  placeholder="e.g. fp16-streaming"
+                  onChange={(event) => setNewPresetName(event.target.value)}
+                />
+              </label>
+              <button type="button" className="secondary" onClick={handleSavePreset} disabled={saving || !newPresetName.trim()}>
+                Save Preset
+              </button>
+            </div>
+            <div className="button-row compact">
+              <button type="button" className="secondary" onClick={handleExportSettings} disabled={!settingsSnapshot}>
+                Export JSON
+              </button>
+              <label className="file-action">
+                <input type="file" accept=".json,application/json" onChange={handleImportSettingsFile} disabled={saving} />
+                <span className="button-like">Import JSON</span>
+              </label>
+            </div>
+            <div className="muted">
+              Presets are loaded from `backend/data/presets`. JSON import/export uses the active runtime settings without touching secret tokens.
+            </div>
+          </div>
           <form className="stack" onSubmit={handleSettingsSubmit}>
             <div className="two-col">
-              <label>Model<select value={draftSettings.active_model} onChange={(event) => setDraftSettings((current) => ({ ...current, active_model: event.target.value }))}>{runtimeSnapshot?.available_models?.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></label>
-              <label>Steps<input type="number" min="1" max="128" value={draftSettings.steps} onChange={(event) => setDraftSettings((current) => ({ ...current, steps: Number(event.target.value) }))} /></label>
-              <label>Batch Wait (ms)<input type="number" min="0" max="5000" value={draftSettings.batch_wait_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, batch_wait_ms: Number(event.target.value) }))} /></label>
-              <label>Chunk Size (ms)<input type="number" min="50" max="5000" value={draftSettings.stream_chunk_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_chunk_ms: Number(event.target.value) }))} /></label>
-              <label>Start Buffer (ms)<input type="number" min="0" max="5000" value={draftSettings.stream_start_buffer_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_start_buffer_ms: Number(event.target.value) }))} /></label>
-              <label>Max Batch Size<input type="number" min="1" max="128" value={draftSettings.max_batch_size} onChange={(event) => setDraftSettings((current) => ({ ...current, max_batch_size: Number(event.target.value) }))} /></label>
-              <label>Max Parallel Requests<input type="number" min="1" max="128" value={draftSettings.max_parallel_requests} onChange={(event) => setDraftSettings((current) => ({ ...current, max_parallel_requests: Number(event.target.value) }))} /></label>
-              <label>Queue Limit<input type="number" min="1" max="2048" value={draftSettings.max_queue_size} onChange={(event) => setDraftSettings((current) => ({ ...current, max_queue_size: Number(event.target.value) }))} /></label>
-              <label>Short Merge Max Chars<input type="number" min="0" max="200" value={draftSettings.short_sentence_merge_max_chars} onChange={(event) => setDraftSettings((current) => ({ ...current, short_sentence_merge_max_chars: Number(event.target.value) }))} /></label>
-              <label>Next Sentence Min Chars<input type="number" min="0" max="500" value={draftSettings.following_sentence_merge_min_chars} onChange={(event) => setDraftSettings((current) => ({ ...current, following_sentence_merge_min_chars: Number(event.target.value) }))} /></label>
+              <label>Model<InfoTip text="The HuggingFace model ID to use for synthesis. Larger models produce higher quality but are slower and use more VRAM." /><select value={draftSettings.active_model} onChange={(event) => setDraftSettings((current) => ({ ...current, active_model: event.target.value }))}>{availableModelOptions.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></label>
+              <label>Precision<InfoTip text="Floating-point precision for inference. FP16 is recommended for speed and quality. BF16 may reduce artifacts on Ampere+ GPUs. FP32 is slowest but most precise." /><select value={draftSettings.model_precision} onChange={(event) => setDraftSettings((current) => ({ ...current, model_precision: event.target.value }))}><option value="fp16">FP16</option><option value="bf16">BF16</option><option value="fp32">FP32</option></select></label>
+              <label>Deterministic Seed<InfoTip text="When set, every request uses this fixed seed for the ODE solver, making identical inputs produce identical audio. Leave empty for random variation per request." /><input type="number" min="0" value={draftSettings.deterministic_seed} placeholder="disabled" onChange={(event) => setDraftSettings((current) => ({ ...current, deterministic_seed: event.target.value }))} /></label>
+              <label>Steps<InfoTip text="Number of ODE solver steps for the Flow Matching diffusion model. More steps = higher quality but slower. 8–16 is a good range; default is 10." /><input type="number" min="1" max="128" value={draftSettings.steps} onChange={(event) => setDraftSettings((current) => ({ ...current, steps: Number(event.target.value) }))} /></label>
+              <label>Batch Wait (ms)<InfoTip text="How long the scheduler waits for additional requests before dispatching a batch. Higher values fill batches better but add latency. 0 = dispatch immediately." /><input type="number" min="0" max="5000" value={draftSettings.batch_wait_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, batch_wait_ms: Number(event.target.value) }))} /></label>
+              <label>Chunk Size (ms)<InfoTip text="Duration of each audio chunk sent to the client during streaming. Smaller chunks = lower latency, larger chunks = fewer network round-trips. Default: 500 ms." /><input type="number" min="50" max="5000" value={draftSettings.stream_chunk_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_chunk_ms: Number(event.target.value) }))} /></label>
+              <label>Start Buffer (ms)<InfoTip text="Audio buffered before the stream begins playback. Prevents stuttering at the cost of initial delay. Default: 500 ms." /><input type="number" min="0" max="5000" value={draftSettings.stream_start_buffer_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_start_buffer_ms: Number(event.target.value) }))} /></label>
+              <label>Max Batch Size<InfoTip text="Maximum number of sentences processed in a single GPU batch. Higher = better throughput but more VRAM. All items in a batch must share the same voice." /><input type="number" min="1" max="128" value={draftSettings.max_batch_size} onChange={(event) => setDraftSettings((current) => ({ ...current, max_batch_size: Number(event.target.value) }))} /></label>
+              <label>Max Parallel Requests<InfoTip text="Maximum number of synthesis requests processed concurrently. Each request may produce multiple sentences that enter the batch queue. Capped by Max Batch Size." /><input type="number" min="1" max="128" value={draftSettings.max_parallel_requests} onChange={(event) => setDraftSettings((current) => ({ ...current, max_parallel_requests: Number(event.target.value) }))} /></label>
+              <label>Queue Limit<InfoTip text="Maximum number of requests waiting in the queue. New requests are rejected with a 503 error when the queue is full." /><input type="number" min="1" max="2048" value={draftSettings.max_queue_size} onChange={(event) => setDraftSettings((current) => ({ ...current, max_queue_size: Number(event.target.value) }))} /></label>
+              <label>Short Merge Max Chars<InfoTip text="Sentences with at most this many characters ending in ! or ? are merged with the following sentence to avoid artifacts from very short TTS inputs. Set to 0 to disable." /><input type="number" min="0" max="200" value={draftSettings.short_sentence_merge_max_chars} onChange={(event) => setDraftSettings((current) => ({ ...current, short_sentence_merge_max_chars: Number(event.target.value) }))} /></label>
+              <label>Next Sentence Min Chars<InfoTip text="Legacy setting (kept for compatibility). Previously required the following sentence to have at least this many characters for a merge. The current merge logic ignores this value." /><input type="number" min="0" max="500" value={draftSettings.following_sentence_merge_min_chars} onChange={(event) => setDraftSettings((current) => ({ ...current, following_sentence_merge_min_chars: Number(event.target.value) }))} /></label>
+              <label>Prompt Start Trim (steps)<InfoTip text="Cuts extra acoustic prompt steps from the beginning of each generated sentence. Increase this if the first word of the reference audio leaks into new sentences. Default: 0." /><input type="number" min="0" max="12" value={draftSettings.prompt_start_trim_steps} onChange={(event) => setDraftSettings((current) => ({ ...current, prompt_start_trim_steps: Number(event.target.value) }))} /></label>
+              <label>VAD Threshold<InfoTip text="Voice Activity Detection energy threshold (percentage of peak). Samples below this level at the end of generated audio are considered silence and trimmed. Lower = more aggressive trimming." /><input type="number" min="0" max="10" step="0.001" value={draftSettings.vad_threshold_pct} onChange={(event) => setDraftSettings((current) => ({ ...current, vad_threshold_pct: Number(event.target.value) }))} /></label>
+              <label>VAD Padding (ms)<InfoTip text="Extra silence kept after the last detected voice activity. Prevents clipping the tail of speech. Default: 150 ms." /><input type="number" min="0" max="5000" value={draftSettings.vad_padding_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, vad_padding_ms: Number(event.target.value) }))} /></label>
+              <label>VAD Fade (ms)<InfoTip text="Fade-out duration applied at the trim point to avoid a hard cut. Creates a smooth transition to silence. Default: 50 ms." /><input type="number" min="0" max="2000" value={draftSettings.vad_fade_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, vad_fade_ms: Number(event.target.value) }))} /></label>
             </div>
-            <label>Sentence Chunking<select value={String(draftSettings.sentence_chunking)} onChange={(event) => setDraftSettings((current) => ({ ...current, sentence_chunking: event.target.value === "true" }))}><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
-            <label>LAN Access<select value={String(draftSettings.allow_lan_access)} onChange={(event) => setDraftSettings((current) => ({ ...current, allow_lan_access: event.target.value === "true" }))}><option value="false">Local only (127.0.0.1)</option><option value="true">Enable LAN (0.0.0.0)</option></select></label>
-            <label>Model Storage Path<input value={draftSettings.model_storage_path} onChange={(event) => setDraftSettings((current) => ({ ...current, model_storage_path: event.target.value }))} /></label>
-            <label>Whisper Base URL<input value={draftSettings.whisper_base_url} onChange={(event) => setDraftSettings((current) => ({ ...current, whisper_base_url: event.target.value }))} placeholder="http://127.0.0.1:8001/v1" /></label>
-            <label>Hugging Face Token<input type="password" placeholder={settingsSnapshot?.hf_token_present ? "Stored" : "Not configured"} onChange={(event) => setDraftSettings((current) => ({ ...current, hf_token: event.target.value }))} /></label>
-            <label>Whisper API Key<input type="password" placeholder={settingsSnapshot?.whisper_api_key_present ? "Stored" : "Optional"} onChange={(event) => setDraftSettings((current) => ({ ...current, whisper_api_key: event.target.value }))} /></label>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={Boolean(draftSettings.persist_generated_wavs)}
+                onChange={(event) => setDraftSettings((current) => ({ ...current, persist_generated_wavs: event.target.checked }))}
+              />
+              <span>Save generated WAVs to disk<InfoTip text="When enabled, every generated audio file is persisted to the backend/generated folder. When disabled, only the latest 100 previews are kept in RAM for this server session." /></span>
+            </label>
+            <div className="muted">
+              When disabled, generation metadata stays in history and the latest 100 WAV previews remain only in RAM for this server session.
+            </div>
+            <label>Sentence Chunking<InfoTip text="When enabled, long texts are split into individual sentences before synthesis. Each sentence is generated separately and concatenated. Improves quality for long texts." /><select value={String(draftSettings.sentence_chunking)} onChange={(event) => setDraftSettings((current) => ({ ...current, sentence_chunking: event.target.value === "true" }))}><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+            <label>VAD Trimming<InfoTip text="When enabled, trailing silence and artifacts at the end of generated audio are automatically removed using Voice Activity Detection." /><select value={String(draftSettings.vad_trimming)} onChange={(event) => setDraftSettings((current) => ({ ...current, vad_trimming: event.target.value === "true" }))}><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+            <label>LAN Access<InfoTip text="Controls whether the server binds to localhost only (127.0.0.1) or all interfaces (0.0.0.0). Enable LAN access to allow other devices on your network to connect. Requires a server restart." /><select value={String(draftSettings.allow_lan_access)} onChange={(event) => setDraftSettings((current) => ({ ...current, allow_lan_access: event.target.value === "true" }))}><option value="false">Local only (127.0.0.1)</option><option value="true">Enable LAN (0.0.0.0)</option></select></label>
+            <label>Model Storage Path<InfoTip text="Local filesystem path where HuggingFace model weights are cached. Changing this requires a server restart." /><input value={draftSettings.model_storage_path} onChange={(event) => setDraftSettings((current) => ({ ...current, model_storage_path: event.target.value }))} /></label>
+            <label>Whisper Base URL<InfoTip text="Base URL of a Whisper-compatible speech-to-text API used for automatic transcription of voice references. Leave empty to disable transcription." /><input value={draftSettings.whisper_base_url} onChange={(event) => setDraftSettings((current) => ({ ...current, whisper_base_url: event.target.value }))} placeholder="http://127.0.0.1:8001/v1" /></label>
+            <label>Hugging Face Token<InfoTip text="Authentication token for downloading gated models from HuggingFace Hub. Required for models that need access approval." /><input type="password" placeholder={settingsSnapshot?.hf_token_present ? "Stored" : "Not configured"} onChange={(event) => setDraftSettings((current) => ({ ...current, hf_token: event.target.value }))} /></label>
+            <label>Whisper API Key<InfoTip text="API key for authenticating with the Whisper transcription service. Only needed if your Whisper server requires authentication." /><input type="password" placeholder={settingsSnapshot?.whisper_api_key_present ? "Stored" : "Optional"} onChange={(event) => setDraftSettings((current) => ({ ...current, whisper_api_key: event.target.value }))} /></label>
             <button type="submit" disabled={saving}>Save Settings</button>
           </form>
         </section>
@@ -1095,61 +1581,14 @@ export default function AdminApp() {
         </section>
       </section>
 
-      <section className="panel-grid">
-        <section className="panel stack full-span">
-          <p className="eyebrow">History</p>
-          <h2>Latest Generations</h2>
-          <div className="table-wrap">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Created</th>
-                  <th>Voice</th>
-                  <th>Text</th>
-                  <th>Audio</th>
-                  <th>TTFT</th>
-                  <th>Total</th>
-                  <th>Batches</th>
-                  <th>Output</th>
-                </tr>
-              </thead>
-              <tbody>
-                {generations.length > 0 ? (
-                  generations.map((item) => (
-                    <tr key={item.generation_id}>
-                      <td className="date-cell">{formatCompactDate(item.created_at)}</td>
-                      <td>{item.voice_name || item.voice_id || "-"}</td>
-                      <td>{item.text || "-"}</td>
-                      <td>{formatSeconds(item.duration_seconds)}</td>
-                      <td>{formatMs(item.ttft_ms)}</td>
-                      <td>{formatMs(item.total_wall_ms)}</td>
-                      <td>{item.batch_count ?? "-"}</td>
-                      <td className="action-cell">
-                        {item.audio_url ? (
-                          <button type="button" className="secondary" onClick={() => window.open(item.audio_url, "_blank", "noopener,noreferrer")}>
-                            Open WAV
-                          </button>
-                        ) : "-"}
-                      </td>
-                    </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan={8}>No generation history has been recorded yet.</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
+      <section className="panel-grid voice-workspace-grid">
         <section className="panel stack">
           <p className="eyebrow">Voices</p>
           <h2>Create Voice</h2>
           <form className="stack" onSubmit={handleVoiceCreate}>
             <div className="two-col">
               <label>Name<input value={voiceForm.name} onChange={(event) => setVoiceForm((current) => ({ ...current, name: event.target.value }))} /></label>
-              <label>Language<select value={voiceForm.language} onChange={(event) => setVoiceForm((current) => ({ ...current, language: event.target.value }))}>{Object.entries(languages).map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select></label>
+              <label>Language<select value={voiceForm.language} onChange={(event) => setVoiceForm((current) => ({ ...current, language: event.target.value }))}>{Object.entries(availableLanguages).map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select></label>
             </div>
             <label>Transcript<textarea value={voiceForm.transcript} onChange={(event) => setVoiceForm((current) => ({ ...current, transcript: event.target.value }))} /></label>
             <input
@@ -1320,7 +1759,7 @@ export default function AdminApp() {
               <div className="card" key={voice.voice_id}>
                 <strong>{voice.name}</strong>
                 <div className="muted">
-                  {languages[voice.language] || voice.language} | {formatSeconds(voice.duration_seconds)} | {formatDate(voice.created_at)}
+                  {availableLanguages[voice.language] || voice.language} | {formatSeconds(voice.duration_seconds)} | {formatDate(voice.created_at)}
                 </div>
                 <div className="muted">
                   Trim: {formatSeconds((voice.trim_start_ms || 0) / 1000)} - {formatSeconds((voice.trim_end_ms || Math.round((voice.duration_seconds || 0) * 1000)) / 1000)}
@@ -1335,6 +1774,55 @@ export default function AdminApp() {
                 </div>
               </div>
             ))}
+          </div>
+        </section>
+      </section>
+
+      <section className="panel-grid">
+        <section className="panel stack full-span">
+          <p className="eyebrow">History</p>
+          <h2>Latest Generations</h2>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Voice</th>
+                  <th>Text</th>
+                  <th>Audio</th>
+                  <th>TTFT</th>
+                  <th>Total</th>
+                  <th>Batches</th>
+                  <th>Output</th>
+                </tr>
+              </thead>
+              <tbody>
+                {generations.length > 0 ? (
+                  generations.map((item) => (
+                    <tr key={item.generation_id}>
+                      <td className="date-cell">{formatCompactDate(item.created_at)}</td>
+                      <td>{item.voice_name || item.voice_id || "-"}</td>
+                      <td>{item.text || "-"}</td>
+                      <td>{formatSeconds(item.duration_seconds)}</td>
+                      <td>{formatMs(item.ttft_ms)}</td>
+                      <td>{formatMs(item.total_wall_ms)}</td>
+                      <td>{item.batch_count ?? "-"}</td>
+                      <td className="action-cell">
+                        {item.audio_url ? (
+                          <button type="button" className="secondary" onClick={() => window.open(item.audio_url, "_blank", "noopener,noreferrer")}>
+                            Open WAV
+                          </button>
+                        ) : <span className="muted">Metadata only</span>}
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={8}>No generation history has been recorded yet.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
         </section>
       </section>

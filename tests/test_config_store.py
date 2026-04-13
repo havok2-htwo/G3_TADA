@@ -18,12 +18,19 @@ class ConfigStoreTests(unittest.TestCase):
                 store = ConfigStore(Path(temp_dir))
                 snapshot = store.export_settings_snapshot()
                 self.assertEqual(snapshot["active_model"], "HumeAI/tada-3b-ml")
+                self.assertEqual(snapshot["model_precision"], "fp16")
+                self.assertIsNone(snapshot["deterministic_seed"])
+                self.assertFalse(snapshot["persist_generated_wavs"])
+                self.assertEqual(snapshot["prompt_start_trim_steps"], 0)
 
                 updated = store.update_settings(
                     {
                         "max_batch_size": 4,
                         "max_parallel_requests": 9,
                         "steps": 200,
+                        "model_precision": "bf16",
+                        "deterministic_seed": 1234,
+                        "persist_generated_wavs": True,
                         "short_sentence_merge_max_chars": 999,
                         "following_sentence_merge_min_chars": -5,
                         "allow_lan_access": True,
@@ -32,6 +39,9 @@ class ConfigStoreTests(unittest.TestCase):
                 self.assertEqual(updated["max_batch_size"], 4)
                 self.assertEqual(updated["max_parallel_requests"], 4)
                 self.assertEqual(updated["steps"], 128)
+                self.assertEqual(updated["model_precision"], "bf16")
+                self.assertEqual(updated["deterministic_seed"], 1234)
+                self.assertTrue(updated["persist_generated_wavs"])
                 self.assertEqual(updated["short_sentence_merge_max_chars"], 200)
                 self.assertEqual(updated["following_sentence_merge_min_chars"], 0)
                 self.assertTrue(updated["allow_lan_access"])
@@ -96,6 +106,37 @@ class ConfigStoreTests(unittest.TestCase):
                     os.environ.pop("TADA_STARTUP_ADMIN_KEY_TTL_SECONDS", None)
                 else:
                     os.environ["TADA_STARTUP_ADMIN_KEY_TTL_SECONDS"] = previous_ttl
+
+    def test_settings_can_be_saved_and_applied_as_presets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous = os.environ.get("TADA_ADMIN_KEY")
+            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
+            try:
+                store = ConfigStore(Path(temp_dir))
+                store.update_settings(
+                    {
+                        "model_precision": "fp32",
+                        "persist_generated_wavs": True,
+                        "steps": 17,
+                    }
+                )
+                preset = store.save_settings_preset("My Fast Preset")
+                self.assertEqual(preset["name"], "my-fast-preset")
+
+                store.update_settings({"model_precision": "fp16", "persist_generated_wavs": False, "steps": 4})
+                applied = store.apply_settings_preset("my-fast-preset")
+                self.assertEqual(applied["model_precision"], "fp32")
+                self.assertTrue(applied["persist_generated_wavs"])
+                self.assertEqual(applied["steps"], 17)
+
+                presets = store.list_settings_presets()
+                self.assertEqual(len(presets), 1)
+                self.assertEqual(presets[0]["label"], "My Fast Preset")
+            finally:
+                if previous is None:
+                    os.environ.pop("TADA_ADMIN_KEY", None)
+                else:
+                    os.environ["TADA_ADMIN_KEY"] = previous
 
 if __name__ == "__main__":
     unittest.main()

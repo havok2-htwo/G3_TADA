@@ -203,6 +203,55 @@ textarea {
   gap: 8px;
 }
 
+.preset-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.file-action {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+}
+
+.file-action input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.button-like {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff7e9;
+  font-weight: 700;
+}
+
 .message {
   margin-top: 16px;
   padding: 12px 14px;
@@ -434,10 +483,94 @@ textarea {
 
 .graph {
   width: 100%;
-  height: 160px;
+  height: 480px;
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03));
   border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.sparkline-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.graph-caption {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-dim);
+  font-size: 0.84rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.graph-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.graph-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.graph-legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18);
+}
+
+.graph-caption strong {
+  color: #fff7e9;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}
+
+.graph-grid-line {
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+}
+
+.graph-reference-line {
+  stroke: rgba(149, 242, 199, 0.55);
+  stroke-width: 1.2;
+  stroke-dasharray: 5 4;
+}
+
+.graph-axis-label,
+.graph-timeline-label {
+  fill: rgba(244, 246, 238, 0.68);
+  font-size: 0.42rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.graph-axis-label-batch {
+  fill: rgba(255, 196, 108, 0.9);
+}
+
+.voice-workspace-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+
+@media (max-width: 980px) {
+  .voice-workspace-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .preset-toolbar {
+    grid-template-columns: 1fr;
+  }
 }
 
 .auth-shell {
@@ -495,4 +628,62 @@ audio {
   .page-shell {
     width: min(100vw - 20px, 1400px);
   }
+}
+
+/* -- InfoTip tooltip --------------------------------------------------- */
+.info-tip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 16px;
+  height: 16px;
+  margin-left: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--text-dim);
+  font-size: 0.62rem;
+  font-weight: 800;
+  cursor: help;
+  flex-shrink: 0;
+  vertical-align: middle;
+  user-select: none;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.info-tip:hover {
+  background: rgba(255, 193, 108, 0.18);
+  color: var(--accent);
+  border-color: rgba(255, 193, 108, 0.36);
+}
+
+.info-tip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 280px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: rgba(20, 28, 36, 0.96);
+  border: 1px solid rgba(255, 193, 108, 0.22);
+  color: #eee8d8;
+  font-size: 0.78rem;
+  font-weight: 400;
+  line-height: 1.45;
+  letter-spacing: 0;
+  text-transform: none;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 160ms ease;
+  z-index: 100;
+  white-space: normal;
+}
+
+.info-tip:hover::after {
+  opacity: 1;
 }

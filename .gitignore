@@ -36,6 +36,7 @@ voices/
 
 # Temporary files
 .tmp/
+test_tmp/
 
 # Torch / torchvision wheels
 torchvision/

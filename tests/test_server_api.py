@@ -112,6 +112,9 @@ class FakeRuntimeService:
     def generated_audio_path(self, file_name):
         return self.generated_file
 
+    def generated_audio_asset(self, file_name):
+        return {"kind": "file", "path": self.generated_file}
+
     def reference_audio_path(self, voice_id):
         return self.reference_file
 
@@ -127,7 +130,12 @@ class FakeScheduler:
         return {"text": text, "voice_id": voice_id}
 
     def wait_for_result(self, state, timeout=None):
-        return {"generation_id": "fake", "text": state["text"], "voice_id": state["voice_id"]}
+        return {
+            "generation_id": "fake",
+            "text": state["text"],
+            "voice_id": state["voice_id"],
+            "audio_url": "/api/assets/generated/tada-generated-test.wav",
+        }
 
     def iter_request_events(self, state):
         yield {"type": "start", "request_id": "fake", "sentence_count": 1}
@@ -210,6 +218,53 @@ class ServerApiTests(unittest.TestCase):
                         headers={"X-Admin-Key": admin_token},
                     )
                     self.assertEqual(reference_allowed.status_code, 200)
+            finally:
+                if previous_admin is None:
+                    os.environ.pop("TADA_ADMIN_KEY", None)
+                else:
+                    os.environ["TADA_ADMIN_KEY"] = previous_admin
+                if previous_warmup is None:
+                    os.environ.pop("TADA_DISABLE_WARMUP", None)
+                else:
+                    os.environ["TADA_DISABLE_WARMUP"] = previous_warmup
+
+    def test_openai_compatible_tts_routes_are_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_admin = os.environ.get("TADA_ADMIN_KEY")
+            previous_warmup = os.environ.get("TADA_DISABLE_WARMUP")
+            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
+            os.environ["TADA_DISABLE_WARMUP"] = "1"
+            try:
+                module = importlib.import_module("backend.server_app")
+                module.config_store = ConfigStore(Path(temp_dir))
+                module.runtime_service = FakeRuntimeService()
+                module.scheduler = FakeScheduler()
+
+                with TestClient(module.app) as client:
+                    models_response = client.get("/v1/models")
+                    self.assertEqual(models_response.status_code, 200)
+                    model_ids = {item["id"] for item in models_response.json()["data"]}
+                    self.assertIn("tada-tts", model_ids)
+
+                    voices_response = client.get("/v1/audio/voices")
+                    self.assertEqual(voices_response.status_code, 200)
+                    self.assertEqual(voices_response.json()["data"][0]["id"], "demo-voice")
+
+                    speech_response = client.post(
+                        "/v1/audio/speech",
+                        json={
+                            "input": "Hallo",
+                            "voice": "Demo",
+                            "model": "tts-1",
+                            "response_format": "mp3",
+                            "seed": 88205,
+                            "temperature": 0.1,
+                        },
+                    )
+                    self.assertEqual(speech_response.status_code, 200)
+                    self.assertEqual(speech_response.headers["content-type"], "audio/wav")
+                    self.assertEqual(speech_response.headers["x-tada-actual-format"], "wav")
+                    self.assertEqual(speech_response.content, b"RIFFdemo")
             finally:
                 if previous_admin is None:
                     os.environ.pop("TADA_ADMIN_KEY", None)
@@ -362,6 +417,96 @@ class ServerApiTests(unittest.TestCase):
                     transcribe_payload = transcribe_response.json()
                     self.assertEqual(transcribe_payload["trim_start_ms"], 250)
                     self.assertEqual(transcribe_payload["trim_end_ms"], 7250)
+            finally:
+                if previous_admin is None:
+                    os.environ.pop("TADA_ADMIN_KEY", None)
+                else:
+                    os.environ["TADA_ADMIN_KEY"] = previous_admin
+                if previous_warmup is None:
+                    os.environ.pop("TADA_DISABLE_WARMUP", None)
+                else:
+                    os.environ["TADA_DISABLE_WARMUP"] = previous_warmup
+
+    def test_admin_settings_route_accepts_precision_and_seed_updates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_admin = os.environ.get("TADA_ADMIN_KEY")
+            previous_warmup = os.environ.get("TADA_DISABLE_WARMUP")
+            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
+            os.environ["TADA_DISABLE_WARMUP"] = "1"
+            try:
+                module = importlib.import_module("backend.server_app")
+                module.config_store = ConfigStore(Path(temp_dir))
+                admin_token = module.config_store.rotate_admin_key(label="Master")["token"]
+                module.runtime_service = FakeRuntimeService()
+                module.scheduler = FakeScheduler()
+
+                with TestClient(module.app) as client:
+                    response = client.put(
+                        "/api/admin/settings",
+                        headers={"X-Admin-Key": admin_token},
+                        json={
+                            "model_precision": "fp32",
+                            "deterministic_seed": 4242,
+                            "persist_generated_wavs": True,
+                            "prompt_start_trim_steps": 3,
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertEqual(payload["settings"]["model_precision"], "fp32")
+                    self.assertEqual(payload["settings"]["deterministic_seed"], 4242)
+                    self.assertTrue(payload["settings"]["persist_generated_wavs"])
+                    self.assertEqual(payload["settings"]["prompt_start_trim_steps"], 3)
+                    self.assertTrue(module.runtime_service.settings_saved)
+            finally:
+                if previous_admin is None:
+                    os.environ.pop("TADA_ADMIN_KEY", None)
+                else:
+                    os.environ["TADA_ADMIN_KEY"] = previous_admin
+                if previous_warmup is None:
+                    os.environ.pop("TADA_DISABLE_WARMUP", None)
+                else:
+                    os.environ["TADA_DISABLE_WARMUP"] = previous_warmup
+
+    def test_admin_settings_presets_can_be_listed_saved_and_applied(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_admin = os.environ.get("TADA_ADMIN_KEY")
+            previous_warmup = os.environ.get("TADA_DISABLE_WARMUP")
+            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
+            os.environ["TADA_DISABLE_WARMUP"] = "1"
+            try:
+                module = importlib.import_module("backend.server_app")
+                module.config_store = ConfigStore(Path(temp_dir))
+                admin_token = module.config_store.rotate_admin_key(label="Master")["token"]
+                module.runtime_service = FakeRuntimeService()
+                module.scheduler = FakeScheduler()
+
+                with TestClient(module.app) as client:
+                    initial_precision = module.config_store.get_settings().model_precision
+                    save_response = client.post(
+                        "/api/admin/settings/presets/save",
+                        headers={"X-Admin-Key": admin_token},
+                        json={"name": "Test Preset"},
+                    )
+                    self.assertEqual(save_response.status_code, 200)
+                    self.assertEqual(save_response.json()["preset"]["name"], "test-preset")
+
+                    list_response = client.get(
+                        "/api/admin/settings/presets",
+                        headers={"X-Admin-Key": admin_token},
+                    )
+                    self.assertEqual(list_response.status_code, 200)
+                    self.assertEqual(len(list_response.json()["presets"]), 1)
+
+                    module.config_store.update_settings({"model_precision": "fp32"})
+                    apply_response = client.post(
+                        "/api/admin/settings/presets/apply",
+                        headers={"X-Admin-Key": admin_token},
+                        json={"name": "test-preset"},
+                    )
+                    self.assertEqual(apply_response.status_code, 200)
+                    self.assertEqual(apply_response.json()["settings"]["model_precision"], initial_precision)
+                    self.assertTrue(module.runtime_service.settings_saved)
             finally:
                 if previous_admin is None:
                     os.environ.pop("TADA_ADMIN_KEY", None)

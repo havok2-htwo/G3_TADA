@@ -40,6 +40,12 @@ class InferenceOptions:
     speed_up_factor: float | None = None
     negative_condition_source: Literal["negative_step_output", "prompt", "zero"] = "negative_step_output"
     text_only_logit_scale: float = 0.0
+    item_seeds: list[int | None] | None = None
+    vad_trimming: bool = True
+    prompt_start_trim_steps: int = 0
+    vad_threshold_pct: float = 0.015
+    vad_padding_ms: int = 150
+    vad_fade_ms: int = 50
 
 
 class TadaConfig(LlamaConfig):
@@ -218,6 +224,52 @@ class TadaForCausalLM(LlamaForCausalLM):
         self._acoustic_spkr_verf.to(self.device)
         self._acoustic_spkr_verf.eval()
         return self._acoustic_spkr_verf
+
+    @staticmethod
+    def _build_item_generators(
+        seeds: list[int | None] | None,
+        *,
+        device: torch.device,
+        batch_size: int,
+    ) -> list[torch.Generator | None]:
+        if not seeds:
+            return [None] * batch_size
+        generators: list[torch.Generator | None] = []
+        device_name = device.type if device.index is None else f"{device.type}:{device.index}"
+        for index in range(batch_size):
+            seed = seeds[index] if index < len(seeds) else None
+            if seed is None:
+                generators.append(None)
+                continue
+            generator = torch.Generator(device=device_name)
+            generator.manual_seed(int(seed))
+            generators.append(generator)
+        return generators
+
+    @staticmethod
+    def _randn_per_item(
+        generators: list[torch.Generator | None],
+        *,
+        shape: tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        rows = [
+            torch.randn(shape, device=device, dtype=dtype, generator=generator)
+            for generator in generators
+        ]
+        return torch.stack(rows, dim=0)
+
+    @staticmethod
+    def _multinomial_per_item(
+        probs: torch.Tensor,
+        generators: list[torch.Generator | None],
+    ) -> torch.Tensor:
+        samples = [
+            torch.multinomial(probs[index], num_samples=1, generator=generators[index])
+            for index in range(probs.shape[0])
+        ]
+        return torch.stack(samples, dim=0)
 
     def _lm_head_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run lm_head, falling back to CPU for MPS (output channels >65536 unsupported)."""
@@ -564,6 +616,7 @@ class TadaForCausalLM(LlamaForCausalLM):
         neg_cond: torch.Tensor,
         opts: InferenceOptions,
         ref_spkr_emb: torch.Tensor | None = None,
+        generators: list[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """
         Generate multiple flow matching candidates and select the best one.
@@ -581,10 +634,23 @@ class TadaForCausalLM(LlamaForCausalLM):
         num_candidates = opts.num_acoustic_candidates
 
         # Sample N different initial noises (scaled by noise temperature)
-        noise = (
-            torch.randn(num_candidates * batch_size, total_dim, device=cond.device, dtype=cond.dtype)
-            * opts.noise_temperature
-        )
+        if generators:
+            noise_rows = []
+            for _ in range(num_candidates):
+                noise_rows.append(
+                    self._randn_per_item(
+                        generators,
+                        shape=(total_dim,),
+                        device=cond.device,
+                        dtype=cond.dtype,
+                    )
+                )
+            noise = torch.cat(noise_rows, dim=0) * opts.noise_temperature
+        else:
+            noise = (
+                torch.randn(num_candidates * batch_size, total_dim, device=cond.device, dtype=cond.dtype)
+                * opts.noise_temperature
+            )
         cond_expanded = cond.repeat(num_candidates, 1, 1)
         # Use actual neg_cond from generation loop (respects negative_condition_source)
         if neg_cond.dim() == 3:
@@ -759,6 +825,7 @@ class TadaForCausalLM(LlamaForCausalLM):
             prefill_len = 0
 
         B = input_ids.shape[0]
+        item_generators = self._build_item_generators(opts.item_seeds, device=input_ids.device, batch_size=B)
 
         if prefill_len > 0:
             if log_time:
@@ -1020,12 +1087,21 @@ class TadaForCausalLM(LlamaForCausalLM):
                     start_time = time.time()
 
             if opts.num_acoustic_candidates > 1:
-                speech = self._solve_flow_matching_ranked(cond, neg_cond, opts, ref_spkr_emb=ref_spkr_emb)
-            else:
-                speech = torch.randn(cond.shape[0], self.config.acoustic_dim).to(cond) * opts.noise_temperature
-                speech = torch.cat(
-                    [speech, torch.randn(cond.shape[0], self.time_dim).to(cond) * opts.noise_temperature], dim=-1
+                speech = self._solve_flow_matching_ranked(
+                    cond,
+                    neg_cond,
+                    opts,
+                    ref_spkr_emb=ref_spkr_emb,
+                    generators=item_generators,
                 )
+            else:
+                total_dim = self.config.acoustic_dim + self.time_dim
+                speech = self._randn_per_item(
+                    item_generators,
+                    shape=(total_dim,),
+                    device=cond.device,
+                    dtype=cond.dtype,
+                ) * opts.noise_temperature
 
                 # Solve flow matching ODE
                 speech = self._solve_flow_matching(
@@ -1097,7 +1173,7 @@ class TadaForCausalLM(LlamaForCausalLM):
                         token_logits = token_logits.masked_fill(indices_to_remove, float("-inf"))
 
                     probs = torch.softmax(token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
+                    next_token = self._multinomial_per_item(probs, item_generators)
                 else:
                     next_token = token_logits.argmax(dim=-1, keepdim=True)
                 input_ids = torch.cat([input_ids, next_token.long()], dim=1)
@@ -1330,13 +1406,15 @@ class TadaForCausalLM(LlamaForCausalLM):
             time_len_after = time_len_after[:, :-num_transition_steps]
 
         num_prompt_tokens = prompt_acoustic_features.shape[1]
+        opts = inference_options
+        prompt_start_trim_steps = max(0, int(opts.prompt_start_trim_steps))
 
         def forward_progress(update: dict) -> None:
             if progress_callback is None:
                 return
             acoustic_features = update["acoustic_features"] * self.config.acoustic_std + self.config.acoustic_mean
             time_before = update["time_before"]
-            stream_offset = num_prompt_tokens + num_transition_steps - 1
+            stream_offset = num_prompt_tokens + num_transition_steps - 1 + prompt_start_trim_steps
             encoded = acoustic_features[..., stream_offset:, :]
             stream_time_before = time_before[..., stream_offset:]
             if encoded.shape[1] <= 0 or stream_time_before.shape[1] <= 1:
@@ -1385,48 +1463,43 @@ class TadaForCausalLM(LlamaForCausalLM):
         
         acoustic_features = outputs.acoustic_features * self.config.acoustic_std + self.config.acoustic_mean
 
-        offset = num_prompt_tokens + num_transition_steps - 1
+        offset = num_prompt_tokens + num_transition_steps - 1 + prompt_start_trim_steps
         encoded = acoustic_features[..., offset :, :]
         time_before = outputs.time_before[..., offset :]
-        
+        decoder_sample_rate = getattr(self.decoder, "sample_rate", None)
+        if not isinstance(decoder_sample_rate, int):
+            decoder_sample_rate = getattr(getattr(self.decoder, "config", None), "sample_rate", 24000)
+        vad_padding_samples = int(round(max(0, opts.vad_padding_ms) * float(decoder_sample_rate) / 1000.0))
+        vad_fade_samples = int(round(max(0, opts.vad_fade_ms) * float(decoder_sample_rate) / 1000.0))
+
         wavs = []
 
         for i in range(encoded.shape[0]):
             try:
-                import os
-                duration_multiplier = float(os.getenv("TADA_DURATION_MULTIPLIER", "1.1"))
-                vad_trimming_enabled = os.getenv("TADA_VAD_TRIMMING", "1") == "1"
-                vad_threshold = float(os.getenv("TADA_VAD_THRESHOLD_PCT", "0.015"))
-                vad_padding_samples = int(int(os.getenv("TADA_VAD_PADDING_MS", "150")) * 24.0)
-                vad_fade_samples = int(int(os.getenv("TADA_VAD_FADE_MS", "50")) * 24.0)
-
-                # Use dynamic duration multiplier to fix swallowed trailing syllables
-                base_keep_len = int(input_lengths[i].item())
-                keep_len = int(base_keep_len * duration_multiplier) + 2 - offset
-                keep_len = max(keep_len, 1)
-                print(f"BATCH {encoded.shape[0]} Item {i}: keep_len={keep_len}, inp_len={base_keep_len}, offset={offset}")
+                generated_keep_len = max(1, int(input_lengths[i].item()) + 2 - offset)
+                keep_len = min(generated_keep_len, int(encoded.shape[1]), int(time_before.shape[1]))
                 valid_encoded = encoded[i, :keep_len]
                 valid_time_before = time_before[i, :keep_len]
-                
+
                 wav = self._decode_wav(valid_encoded, time_before=valid_time_before).squeeze(0, 1)
-                wav = wav[..., int(24000 * valid_time_before[0] / 50) :]  # remove leading silence
-                
-                if vad_trimming_enabled:
+                wav = wav[..., int(decoder_sample_rate * valid_time_before[0] / 50) :]  # remove leading silence
+
+                if opts.vad_trimming:
                     abs_wav = torch.abs(wav)
                     if abs_wav.ndim > 1:
                         abs_wav = abs_wav.max(dim=0)[0]
-                    non_silent = torch.where(abs_wav > vad_threshold)[0]
-                    
+                    non_silent = torch.where(abs_wav > opts.vad_threshold_pct)[0]
+
                     if len(non_silent) > 0:
                         last_voice_sample = non_silent[-1].item()
                         cut_index = min(wav.shape[-1], last_voice_sample + vad_padding_samples)
                         wav = wav[..., :cut_index]
-                        
+
                         if vad_fade_samples > 0:
                             fade_out_len = min(vad_fade_samples, wav.shape[-1])
                             fade_curve = torch.linspace(1.0, 0.0, fade_out_len, device=wav.device, dtype=wav.dtype)
                             wav[..., -fade_out_len:] = wav[..., -fade_out_len:] * fade_curve
-                
+
                 # Apply strict 50ms fade-in to mute prompt audio leakage
                 fade_len = min(1200, wav.shape[-1])
                 if fade_len > 0:
@@ -1488,7 +1561,3 @@ class TadaForCausalLM(LlamaForCausalLM):
     def to(self, device: str):
         self.decoder.to(device)
         return super().to(device)
-
-
-
-

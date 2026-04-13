@@ -3,6 +3,7 @@ setlocal EnableExtensions
 
 set "ROOT=%~dp0"
 pushd "%ROOT%" >nul
+title G3 TADA3B Server
 
 set "PYTHON_EXE="
 set "CONDA_ENV_DIR=%ROOT%.conda-env"

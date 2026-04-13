@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import threading
 from dataclasses import asdict, dataclass
@@ -38,6 +39,54 @@ def _clamp_int(value: Any, *, minimum: int, maximum: int, default: int) -> int:
     return max(minimum, min(maximum, numeric))
 
 
+def _clamp_float(value: Any, *, minimum: float, maximum: float, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = default
+    return max(minimum, min(maximum, numeric))
+
+
+def _optional_int(value: Any, *, minimum: int, maximum: int) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        numeric = int(text)
+    except (TypeError, ValueError):
+        return None
+    return max(minimum, min(maximum, numeric))
+
+
+def _normalize_model_precision(value: Any, *, default: str = "fp16") -> str:
+    candidate = str(value or default).strip().lower() or default
+    if candidate not in {"fp16", "bf16", "fp32"}:
+        return default
+    return candidate
+
+
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def _slugify_preset_name(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-._").lower()
+    return cleaned or "preset"
+
+
 def _clean_path(value: Any, fallback: str) -> str:
     text = str(value or "").strip()
     return text or fallback
@@ -46,6 +95,9 @@ def _clean_path(value: Any, fallback: str) -> str:
 @dataclass
 class ServerSettings:
     active_model: str
+    model_precision: str
+    deterministic_seed: int | None
+    persist_generated_wavs: bool
     steps: int
     sentence_chunking: bool
     short_sentence_merge_max_chars: int
@@ -61,7 +113,7 @@ class ServerSettings:
     whisper_base_url: str
     
     vad_trimming: bool
-    duration_multiplier: float
+    prompt_start_trim_steps: int
     vad_threshold_pct: float
     vad_padding_ms: int
     vad_fade_ms: int
@@ -77,6 +129,9 @@ class ServerSettings:
         )
         return cls(
             active_model=str(payload.get("active_model") or "HumeAI/tada-3b-ml").strip() or "HumeAI/tada-3b-ml",
+            model_precision=_normalize_model_precision(payload.get("model_precision"), default="fp16"),
+            deterministic_seed=_optional_int(payload.get("deterministic_seed"), minimum=0, maximum=2**63 - 1),
+            persist_generated_wavs=_coerce_bool(payload.get("persist_generated_wavs"), default=False),
             steps=_clamp_int(payload.get("steps"), minimum=1, maximum=128, default=10),
             sentence_chunking=bool(payload.get("sentence_chunking", True)),
             short_sentence_merge_max_chars=_clamp_int(
@@ -106,8 +161,13 @@ class ServerSettings:
             model_storage_path=_clean_path(payload.get("model_storage_path"), fallback_storage_path),
             whisper_base_url=str(payload.get("whisper_base_url") or "").strip(),
             vad_trimming=bool(payload.get("vad_trimming", True)),
-            duration_multiplier=float(payload.get("duration_multiplier", 1.1)),
-            vad_threshold_pct=float(payload.get("vad_threshold_pct", 0.01)),
+            prompt_start_trim_steps=_clamp_int(
+                payload.get("prompt_start_trim_steps"),
+                minimum=0,
+                maximum=12,
+                default=0,
+            ),
+            vad_threshold_pct=_clamp_float(payload.get("vad_threshold_pct"), minimum=0.0, maximum=10.0, default=0.015),
             vad_padding_ms=_clamp_int(payload.get("vad_padding_ms"), minimum=0, maximum=5000, default=150),
             vad_fade_ms=_clamp_int(payload.get("vad_fade_ms"), minimum=0, maximum=2000, default=50),
         )
@@ -121,6 +181,7 @@ class ConfigStore:
         self.project_root = project_root
         self.backend_dir = project_root / "backend"
         self.data_dir = self.backend_dir / "data"
+        self.presets_dir = self.data_dir / "presets"
         self.settings_path = self.data_dir / "server_settings.json"
         self.secrets_path = self.data_dir / "server_secrets.json"
         self._lock = threading.RLock()
@@ -136,6 +197,7 @@ class ConfigStore:
             self._startup_admin_key_expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.presets_dir.mkdir(parents=True, exist_ok=True)
         self._seed_files()
 
     def _default_storage_path(self) -> str:
@@ -148,6 +210,9 @@ class ConfigStore:
                 seeded_settings = ServerSettings.from_payload(
                     {
                         "active_model": os.getenv("TADA_MODEL_NAME", "HumeAI/tada-3b-ml"),
+                        "model_precision": os.getenv("TADA_MODEL_PRECISION", "fp16"),
+                        "deterministic_seed": os.getenv("TADA_DETERMINISTIC_SEED"),
+                        "persist_generated_wavs": False,
                         "steps": os.getenv("TADA_DEFAULT_STEPS", "10"),
                         "sentence_chunking": True,
                         "short_sentence_merge_max_chars": 30,
@@ -162,7 +227,7 @@ class ConfigStore:
                         "model_storage_path": os.getenv("HF_HUB_CACHE", self._default_storage_path()),
                         "whisper_base_url": "",
                         "vad_trimming": True,
-                        "duration_multiplier": 1.1,
+                        "prompt_start_trim_steps": 0,
                         "vad_threshold_pct": 0.015,
                         "vad_padding_ms": 150,
                         "vad_fade_ms": 50,
@@ -200,15 +265,20 @@ class ConfigStore:
         settings = self.get_settings()
         os.environ["HF_HUB_CACHE"] = str(Path(settings.model_storage_path).expanduser())
         os.environ["TADA_MODEL_NAME"] = settings.active_model
+        os.environ["TADA_MODEL_PRECISION"] = settings.model_precision
         os.environ["TADA_DEFAULT_STEPS"] = str(settings.steps)
-        
-        # Audio VAD Overrides
+
+        if settings.deterministic_seed is None:
+            os.environ.pop("TADA_DETERMINISTIC_SEED", None)
+        else:
+            os.environ["TADA_DETERMINISTIC_SEED"] = str(settings.deterministic_seed)
+
         os.environ["TADA_VAD_TRIMMING"] = "1" if settings.vad_trimming else "0"
-        os.environ["TADA_DURATION_MULTIPLIER"] = str(settings.duration_multiplier)
+        os.environ["TADA_PROMPT_START_TRIM_STEPS"] = str(settings.prompt_start_trim_steps)
         os.environ["TADA_VAD_THRESHOLD_PCT"] = str(settings.vad_threshold_pct)
         os.environ["TADA_VAD_PADDING_MS"] = str(settings.vad_padding_ms)
         os.environ["TADA_VAD_FADE_MS"] = str(settings.vad_fade_ms)
-        
+
         hf_token = self.get_hf_token()
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
@@ -243,6 +313,89 @@ class ConfigStore:
                 self._update_secret_value("whisper_api_key", str(next_whisper_api_key).strip())
 
         return self.export_settings_snapshot(restart_required=restart_required)
+
+    @staticmethod
+    def _settings_field_names() -> set[str]:
+        return set(ServerSettings.__dataclass_fields__.keys())
+
+    def export_settings_payload(self) -> dict[str, Any]:
+        return self.get_settings().to_dict()
+
+    def _extract_settings_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("Settings payload must be a JSON object.")
+        candidate = payload.get("settings") if isinstance(payload.get("settings"), dict) else payload
+        if not isinstance(candidate, dict):
+            raise ValueError("Imported preset does not contain a valid 'settings' object.")
+        fields = self._settings_field_names()
+        filtered = {key: candidate[key] for key in fields if key in candidate}
+        if not filtered:
+            raise ValueError("No known server settings were found in the imported payload.")
+        return filtered
+
+    def import_settings_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.update_settings(self._extract_settings_payload(payload))
+
+    def list_settings_presets(self) -> list[dict[str, Any]]:
+        self.presets_dir.mkdir(parents=True, exist_ok=True)
+        presets: list[dict[str, Any]] = []
+        for path in sorted(self.presets_dir.glob("*.json"), key=lambda item: item.name.lower()):
+            try:
+                payload = _json_load(path)
+                settings_payload = self._extract_settings_payload(payload)
+            except Exception:
+                continue
+            presets.append(
+                {
+                    "name": path.stem,
+                    "label": str(payload.get("preset_name") or path.stem),
+                    "file_name": path.name,
+                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+                    "settings": settings_payload,
+                }
+            )
+        return presets
+
+    def save_settings_preset(self, name: str) -> dict[str, Any]:
+        label = str(name or "").strip()
+        if not label:
+            raise ValueError("Preset name must not be empty.")
+        file_stem = _slugify_preset_name(label)
+        path = self.presets_dir / f"{file_stem}.json"
+        payload = {
+            "preset_name": label,
+            "saved_at": now_iso(),
+            "settings": self.export_settings_payload(),
+        }
+        _json_dump(path, payload)
+        return {
+            "name": file_stem,
+            "label": label,
+            "file_name": path.name,
+            "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        }
+
+    def apply_settings_preset(self, name: str) -> dict[str, Any]:
+        preset_name = str(name or "").strip()
+        if not preset_name:
+            raise ValueError("Preset name must not be empty.")
+        candidate_names = []
+        if preset_name.lower().endswith(".json"):
+            candidate_names.append(preset_name)
+        candidate_names.append(f"{preset_name}.json")
+        candidate_names.append(f"{_slugify_preset_name(preset_name)}.json")
+
+        preset_path: Path | None = None
+        for candidate in candidate_names:
+            path = self.presets_dir / candidate
+            if path.exists():
+                preset_path = path
+                break
+        if preset_path is None:
+            raise FileNotFoundError(f"Preset '{preset_name}' was not found in {self.presets_dir}.")
+
+        payload = _json_load(preset_path)
+        return self.import_settings_payload(payload)
 
     def export_settings_snapshot(self, *, restart_required: bool = False) -> dict[str, Any]:
         settings = self.get_settings()

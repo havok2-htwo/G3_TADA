@@ -29,16 +29,22 @@ Implemented now:
 
 - persistent server settings in `backend/data/server_settings.json`
 - secret storage in `backend/data/server_secrets.json`
+- saved settings presets in `backend/data/presets/*.json`
 - single admin key workflow with persistent hashed storage and startup recovery key
 - admin endpoints under `/api/admin/...`
 - public versioned endpoints under `/api/v1/...`
-- round-robin sentence batching with queueing and concurrency limits
-- heterogenous prompt batching for different voices in the same TADA batch
+- OpenAI-compatible TTS endpoints under `/v1/...` for tools like Open WebUI
+- sentence-level fair-share batching with queueing and concurrency limits
+- voice-only batching inside one TADA batch
 - progressive preview streaming while the first batch is still running
 - dashboard snapshots and a live dashboard stream endpoint
 - persistent generation history for the admin dashboard
+- optional RAM-only generated audio storage with recent in-memory WAV asset serving
 - model download jobs and local model readiness checks
+- runtime tuning for model precision, deterministic seeding, sentence merge heuristics, and VAD/prompt trimming
 - separate `Admin` and `Demo` React frontends built from the same Vite project
+- admin-side preset save/apply plus local JSON export/import of runtime settings
+- CLI helpers for benchmark corpus preparation and HTTP benchmarking/load testing
 - portable install/start scripts for Windows and Linux source installs
 - a Windows fat-bundle packager that creates a copy-and-deploy ZIP
 
@@ -61,7 +67,7 @@ The runtime has four layers:
    - `backend/runtime_service.py`
    - loads models and encoders
    - creates voices
-   - merges cached prompts into real heterogeneous TADA batches
+   - merges cached prompts into real voice-isolated TADA batches
    - exposes model download and Whisper helper functions
 
 3. Batch scheduler
@@ -90,15 +96,17 @@ The scheduler is intentionally simple and deterministic.
 ### Active pool
 
 - only `max_parallel_requests` requests are active at once
-- active requests each contribute at most one sentence per batch
+- active requests first contribute one sentence each to the next batch
+- if slots remain, the batch is filled round-robin with additional sentences from those same active requests
 - while all active requests are still busy, additional requests wait in the queue
 
 ### Round-robin fairness
 
 Example with `max_parallel_requests=16`:
 
-- batch 1 contains sentence 1 from up to 16 active requests
-- batch 2 contains sentence 2 from those requests that still have more text
+- batch 1 first takes sentence 1 from up to 16 active requests
+- if that batch still has free slots after the first fairness pass, it keeps filling with sentence 2, sentence 3, and so on in round-robin order from the same active requests
+- batch 2 continues with the remaining queued sentence work items
 - if one request finishes early, the next waiting request is promoted and can join the following batch
 
 ### Streaming behavior
@@ -128,6 +136,10 @@ The dashboard is protected by a single admin key, while synthesis stays public.
 - `GET /api/v1/voices` is open
 - `POST /api/v1/synthesize` is open
 - `POST /api/v1/synthesize/stream` is open
+- `GET /v1/models` is open
+- `GET /v1/voices` is open
+- `GET /v1/audio/voices` is open
+- `POST /v1/audio/speech` is open
 - `GET /api/assets/generated/{file_name}` is open so public responses remain directly usable
 
 Reference voice audio stays admin-only because it exposes the underlying stored prompt material.
@@ -139,8 +151,13 @@ Persistent settings live in `backend/data/server_settings.json`.
 Current settings include:
 
 - `active_model`
+- `model_precision`
+- `deterministic_seed`
+- `persist_generated_wavs`
 - `steps`
 - `sentence_chunking`
+- `short_sentence_merge_max_chars`
+- `following_sentence_merge_min_chars`
 - `allow_lan_access`
 - `stream_start_buffer_ms`
 - `stream_chunk_ms`
@@ -150,11 +167,18 @@ Current settings include:
 - `max_queue_size`
 - `model_storage_path`
 - `whisper_base_url`
+- `vad_trimming`
+- `prompt_start_trim_steps`
+- `vad_threshold_pct`
+- `vad_padding_ms`
+- `vad_fade_ms`
 
 Notes:
 
 - `max_parallel_requests` is clamped to `max_batch_size`
 - changing `model_storage_path` or `allow_lan_access` is treated as restart-required
+- `deterministic_seed` is expanded into stable per-sentence seeds based on model, voice and normalized text, so repeated requests can be made reproducible without forcing every sentence to reuse the exact same raw seed
+- `persist_generated_wavs=false` keeps recent generated WAVs only in memory for the current server process; generation metadata stays in history either way
 - `HF_TOKEN` and other environment values are used to seed first-run defaults, but the persisted config is the supported runtime source afterwards
 - `config_store.apply_runtime_environment()` applies the persisted active model, steps and model cache path on startup
 
@@ -209,10 +233,17 @@ For a dedicated endpoint-by-endpoint integration reference, see [API_DOCUMENTATI
 - admin routes: `X-Admin-Key`
 - public routes: none
 
+### Diagnostic route
+
+- `GET /api/health`
+
 ### Admin routes
 
 - `GET /api/admin/settings`
 - `PUT /api/admin/settings`
+- `GET /api/admin/settings/presets`
+- `POST /api/admin/settings/presets/save`
+- `POST /api/admin/settings/presets/apply`
 - `GET /api/admin/models`
 - `POST /api/admin/models/download`
 - `GET /api/admin/voices`
@@ -226,10 +257,26 @@ For a dedicated endpoint-by-endpoint integration reference, see [API_DOCUMENTATI
 
 ### Public routes
 
+- legacy public routes used by the built-in demo and local tools:
 - `GET /api/v1/voices`
 - `POST /api/v1/synthesize`
 - `POST /api/v1/synthesize/stream`
 - `GET /api/assets/generated/{file_name}`
+
+- OpenAI-compatible TTS routes used by external tools such as Open WebUI:
+- `GET /v1/models`
+- `GET /v1/voices`
+- `GET /v1/audio/voices`
+- `POST /v1/audio/speech`
+
+OpenAI compatibility notes:
+
+- the old `/api/v1/...` routes remain supported and are not deprecated
+- `POST /v1/audio/speech` accepts the usual OpenAI-style fields `input`, `voice`, `model`, `response_format`, and `speed`
+- additional unknown JSON fields are accepted and ignored for compatibility
+- `voice` may be either a stored `voice_id` or the saved voice name
+- `model` is accepted for compatibility, but synthesis still uses the server's currently active TADA model from the admin settings
+- unsupported response formats fall back to WAV and return `X-TADA-Actual-Format: wav`
 
 ### Admin-only asset routes
 
@@ -254,6 +301,8 @@ Chunk events contain at least:
 - `pcm16_b64`
 - `final_chunk_of_sentence`
 - `emitted_audio_ms`
+- `progress_step`
+- `preview`
 
 ## 10. Frontends
 
@@ -267,6 +316,8 @@ Responsibilities:
 
 - enter or rotate the admin key
 - manage settings and secrets
+- save/apply named presets from `backend/data/presets`
+- export/import runtime settings as local JSON files
 - watch queue/dashboard metrics
 - inspect the latest generation history
 - trigger model downloads
@@ -288,6 +339,16 @@ Responsibilities:
 Browser note:
 
 - local folder saving requires a Chromium-class browser with File System Access API support
+
+### CLI benchmark helpers
+
+Useful repo-local scripts outside the browser UI:
+
+- `prepare_benchmark_corpus.py`: scans raw audio from `voices/`, keeps only usable reference clips, resamples them to `24 kHz`, adds prompt-tail silence, optionally transcribes them, and writes a manifest under `tests/fixtures/benchmark_voices/`
+- `run_server_benchmark.py`: launches a fixed-size parallel HTTP benchmark against `/api/v1/synthesize/stream` and writes JSON results to `benchmark_results/server_http/`
+- `run_server_loadtest.py`: generates a deterministic multi-user arrival pattern for a longer HTTP load test and writes per-request, per-user and health snapshots to `benchmark_results/server_loadtest/`
+
+The older `run_benchmark_1b.py` and `run_benchmark_3b.py` scripts still exist for direct raw-model experiments, but the supported product path is the server/runtime stack above.
 
 ## 11. Important Files
 
@@ -317,11 +378,17 @@ Validated in this repo now:
 Current automated tests cover:
 
 - config persistence and admin-key behavior
+- temporary startup admin-key acceptance and expiry behavior
+- settings presets plus admin settings precision/seed/persistence fields
 - prompt batch merging
-- round-robin scheduler ordering
+- short-sentence merging rules including short `.` sentences and cascading short tails
+- round-robin scheduler ordering with voice-only batch isolation
 - progressive preview chunk emission without duplicated samples
-- basic admin/public API auth wiring, open public routes, and generation history
-- release bundle model-cache copying
+- in-memory versus disk-backed generated audio history/assets
+- Whisper endpoint fallback handling for OpenAI-style and Genesis-style STT servers
+- benchmark corpus preparation and transcript cache reuse
+- basic admin/public API auth wiring, preset routes, OpenAI-compatible TTS routes, and generation history
+- release bundle model-cache copying from the configured storage root
 
 ## 13. Quick Start
 
@@ -346,6 +413,7 @@ Notes:
 - `install.bat` is conda-first and creates a project-local `.conda-env/` by default
 - on Windows the installer prefers a pinned NVIDIA CUDA PyTorch stack from `https://download.pytorch.org/whl/cu128`
 - if direct `pip` writes into the managed environment fail, the installer falls back automatically to project-local `.python_packages/` and records that in `.runtime_package_mode`
+- the shared installer runs a runtime smokecheck at the end and retries the pinned core runtime once if that import validation still fails
 - if `frontend/dist` already exists, npm is not required on the target machine
 - if `wheelhouse/` exists, the installer uses it as an offline package source
 - `TADA_CONDA_EXE`, `TADA_CONDA_ENV_DIR`, `TADA_CONDA_PYTHON_VERSION`, `TADA_TORCH_INDEX_URL` and `TADA_PYTHON` can override the default install behavior
@@ -358,6 +426,11 @@ Notes:
 ./install.sh
 ./start.sh
 ```
+
+Linux notes:
+
+- `install.sh` prefers a local `.venv/`, reuses `env/` if present, and otherwise falls back to a suitable system `python3`/`python`
+- it uses the same shared `tools/install_runtime.py` workflow as Windows, including wheelhouse/offline support, frontend validation/build, vendor checks, and the final runtime smokecheck
 
 ### Windows fat bundle deploy
 

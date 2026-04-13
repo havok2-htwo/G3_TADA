@@ -29,20 +29,20 @@ class FakeEncoderOutput:
 
 class PromptBatchTests(unittest.TestCase):
     def test_sentence_splitter_preserves_order(self):
-        parts = split_sentences("Hallo Welt. Das ist gut!\nNoch ein Satz?", enabled=True)
-        self.assertEqual(parts, ["Hallo Welt.", "Das ist gut!", "Noch ein Satz?"])
+        parts = split_sentences("Das ist ein laengerer Einstiegssatz. Das ist gut!\nNoch ein Satz?", enabled=True)
+        self.assertEqual(parts, ["Das ist ein laengerer Einstiegssatz.", "Das ist gut!", "Noch ein Satz?"])
 
     def test_sentence_splitter_merges_short_sentence_with_next(self):
         parts = split_sentences("Hallo Matthias! Schön, Sie wiederzusehen.", enabled=True)
         self.assertEqual(parts, ["Hallo Matthias! Schön, Sie wiederzusehen."])
 
-    def test_sentence_splitter_never_merges_more_than_two_sentences(self):
+    def test_sentence_splitter_cascades_consecutive_short_sentences(self):
         parts = split_sentences("Hi! Ja! Dann geht es weiter.", enabled=True)
-        self.assertEqual(parts, ["Hi!", "Ja! Dann geht es weiter."])
+        self.assertEqual(parts, ["Hi! Ja! Dann geht es weiter."])
 
-    def test_sentence_splitter_does_not_merge_short_period_sentence(self):
+    def test_sentence_splitter_merges_short_period_sentence(self):
         parts = split_sentences("Hallo Welt. Das ist gut!", enabled=True)
-        self.assertEqual(parts, ["Hallo Welt.", "Das ist gut!"])
+        self.assertEqual(parts, ["Hallo Welt. Das ist gut!"])
 
     def test_sentence_splitter_respects_configurable_thresholds(self):
         parts = split_sentences(
@@ -52,6 +52,22 @@ class PromptBatchTests(unittest.TestCase):
             following_sentence_merge_min_chars=20,
         )
         self.assertEqual(parts, ["Hallo Matthias!", "Schön, Sie wiederzusehen."])
+
+    def test_sentence_splitter_backward_merge_orphaned_short_tail(self):
+        parts = split_sentences("Er sagte etwas. Ok! Ja!", enabled=True)
+        self.assertEqual(parts, ["Er sagte etwas. Ok! Ja!"])
+
+    def test_sentence_splitter_merges_two_short_sentences_only(self):
+        parts = split_sentences("Ok! Ja!", enabled=True)
+        self.assertEqual(parts, ["Ok! Ja!"])
+
+    def test_sentence_splitter_short_with_short_follower(self):
+        parts = split_sentences("Hallo! Wie geht es dir?", enabled=True)
+        self.assertEqual(parts, ["Hallo! Wie geht es dir?"])
+
+    def test_sentence_splitter_many_short_cascade(self):
+        parts = split_sentences("Wow! Cool! Super! Na dann.", enabled=True)
+        self.assertEqual(parts, ["Wow! Cool! Super! Na dann."])
 
     def test_merge_encoder_outputs_keeps_per_row_prompt_data(self):
         prompt_a = FakeEncoderOutput(

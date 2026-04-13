@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -7,12 +8,13 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
+import soundfile as sf
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.batch_scheduler import BatchScheduler
 from backend.config_store import ConfigStore
@@ -29,6 +31,9 @@ scheduler = BatchScheduler(runtime_service, config_store)
 
 class AdminSettingsUpdateRequest(BaseModel):
     active_model: Optional[str] = None
+    model_precision: Optional[Literal["fp16", "bf16", "fp32"]] = None
+    deterministic_seed: Optional[int] = Field(default=None, ge=0, le=2**63 - 1)
+    persist_generated_wavs: Optional[bool] = None
     steps: Optional[int] = Field(default=None, ge=1, le=128)
     sentence_chunking: Optional[bool] = None
     short_sentence_merge_max_chars: Optional[int] = Field(default=None, ge=0, le=200)
@@ -47,7 +52,7 @@ class AdminSettingsUpdateRequest(BaseModel):
     
     # VAD & Audio Settings
     vad_trimming: Optional[bool] = None
-    duration_multiplier: Optional[float] = Field(default=None, ge=0.5, le=5.0)
+    prompt_start_trim_steps: Optional[int] = Field(default=None, ge=0, le=12)
     vad_threshold_pct: Optional[float] = Field(default=None, ge=0.0, le=10.0)
     vad_padding_ms: Optional[int] = Field(default=None, ge=0, le=5000)
     vad_fade_ms: Optional[int] = Field(default=None, ge=0, le=2000)
@@ -57,9 +62,33 @@ class ModelDownloadRequest(BaseModel):
     model_id: str
 
 
+class SettingsPresetRequest(BaseModel):
+    name: str
+
+
 class PublicSynthesizeRequest(BaseModel):
     text: str
     voice_id: str
+
+
+class OpenAICompatibleSpeechRequest(BaseModel):
+    model: Optional[str] = None
+    input: str
+    voice: str
+    response_format: Optional[str] = "wav"
+    speed: Optional[float] = Field(default=1.0, ge=0.25, le=4.0)
+    instructions: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+
+
+OPENAI_TTS_COMPAT_MODELS = {
+    "tada-tts": None,
+    "tada-3b-ml-tts": "HumeAI/tada-3b-ml",
+    "tada-1b-tts": "HumeAI/tada-1b",
+    "tts-1": None,
+    "tts-1-hd": None,
+    "gpt-4o-mini-tts": None,
+}
 
 
 def _unauthorized(message: str) -> HTTPException:
@@ -70,6 +99,95 @@ def require_admin_key(x_admin_key: Optional[str] = Header(None)) -> dict[str, st
     if not config_store.verify_admin_key((x_admin_key or "").strip()):
         raise _unauthorized("A valid X-Admin-Key header is required.")
     return {"role": "admin"}
+
+
+def _resolve_openai_voice_id(raw_voice: str) -> str:
+    requested = (raw_voice or "").strip()
+    if not requested:
+        raise HTTPException(status_code=400, detail="The 'voice' field is required.")
+
+    voices = runtime_service.list_voices()
+    for voice in voices:
+        if voice.get("voice_id") == requested:
+            return str(voice["voice_id"])
+
+    normalized = requested.casefold()
+    for voice in voices:
+        voice_id = str(voice.get("voice_id") or "")
+        voice_name = str(voice.get("name") or "")
+        if voice_name.casefold() == normalized or voice_id.casefold() == normalized:
+            return voice_id
+
+    raise HTTPException(status_code=404, detail=f"Voice '{requested}' was not found.")
+
+
+def _coerce_openai_tts_model(raw_model: str | None) -> str:
+    settings = config_store.get_settings()
+    requested = (raw_model or "").strip()
+    if not requested:
+        return settings.active_model
+    lowered = requested.casefold()
+    if requested == settings.active_model:
+        return settings.active_model
+    if lowered == settings.active_model.casefold():
+        return settings.active_model
+    if lowered in OPENAI_TTS_COMPAT_MODELS:
+        return settings.active_model
+    return settings.active_model
+
+
+def _openai_tts_model_payloads() -> list[dict[str, Any]]:
+    settings = config_store.get_settings()
+    return [
+        {"id": "tada-tts", "object": "model", "created": 0, "owned_by": "tada-local"},
+        {"id": "tada-3b-ml-tts", "object": "model", "created": 0, "owned_by": "tada-local"},
+        {"id": "tada-1b-tts", "object": "model", "created": 0, "owned_by": "tada-local"},
+        {
+            "id": settings.active_model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "tada-local",
+        },
+    ]
+
+
+def _openai_tts_voice_payloads() -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for voice in runtime_service.list_voices():
+        payloads.append(
+            {
+                "id": voice["voice_id"],
+                "object": "voice",
+                "name": voice.get("name") or voice["voice_id"],
+                "language": voice.get("language"),
+                "preview_url": voice.get("reference_url"),
+            }
+        )
+    return payloads
+
+
+def _load_generated_audio_bytes(result: dict[str, Any]) -> bytes:
+    audio_url = str(result.get("audio_url") or "").strip()
+    if not audio_url:
+        raise RuntimeError("Synthesis result did not include an audio URL.")
+    file_name = Path(audio_url).name
+    if hasattr(runtime_service, "generated_audio_asset"):
+        asset = runtime_service.generated_audio_asset(file_name)
+        if asset.get("kind") == "memory":
+            return bytes(asset["content"])
+        return Path(asset["path"]).read_bytes()
+    return runtime_service.generated_audio_path(file_name).read_bytes()
+
+
+def _audio_response_from_wav_bytes(wav_bytes: bytes, *, response_format: str | None, active_model: str) -> Response:
+    normalized = (response_format or "wav").strip().lower()
+    headers = {"X-TADA-Active-Model": active_model}
+    if normalized in {"pcm", "s16le"}:
+        audio, _ = sf.read(io.BytesIO(wav_bytes), dtype="int16", always_2d=False)
+        return Response(content=audio.tobytes(), media_type="audio/pcm", headers=headers)
+    if normalized not in {"wav", "wave"}:
+        headers["X-TADA-Actual-Format"] = "wav"
+    return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
 
 
 app = FastAPI(title="TADA Batch TTS Server", version="1.0.0")
@@ -129,6 +247,7 @@ def health() -> dict[str, Any]:
 def admin_settings(_: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]:
     return {
         "settings": config_store.export_settings_snapshot(),
+        "presets": config_store.list_settings_presets(),
         "runtime": runtime_service.status(),
         "models": runtime_service.model_statuses(),
     }
@@ -139,11 +258,58 @@ def update_admin_settings(
     request: AdminSettingsUpdateRequest,
     _: dict[str, str] = Depends(require_admin_key),
 ) -> dict[str, Any]:
-    payload = request.model_dump(exclude_none=True)
+    payload = request.model_dump(exclude_unset=True)
     updated = config_store.update_settings(payload)
-    runtime_service.sync_runtime_settings()
+    config_store.apply_runtime_environment()
+    try:
+        runtime_service.sync_runtime_settings()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "settings": updated,
+        "presets": config_store.list_settings_presets(),
+        "runtime": runtime_service.status(),
+        "models": runtime_service.model_statuses(),
+    }
+
+
+@app.get("/api/admin/settings/presets")
+def admin_settings_presets(_: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]:
+    return {"presets": config_store.list_settings_presets()}
+
+
+@app.post("/api/admin/settings/presets/save")
+def admin_save_settings_preset(
+    request: SettingsPresetRequest,
+    _: dict[str, str] = Depends(require_admin_key),
+) -> dict[str, Any]:
+    try:
+        preset = config_store.save_settings_preset(request.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "preset": preset,
+        "presets": config_store.list_settings_presets(),
+        "settings": config_store.export_settings_snapshot(),
+    }
+
+
+@app.post("/api/admin/settings/presets/apply")
+def admin_apply_settings_preset(
+    request: SettingsPresetRequest,
+    _: dict[str, str] = Depends(require_admin_key),
+) -> dict[str, Any]:
+    try:
+        settings_snapshot = config_store.apply_settings_preset(request.name)
+        config_store.apply_runtime_environment()
+        runtime_service.sync_runtime_settings()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "settings": settings_snapshot,
+        "presets": config_store.list_settings_presets(),
         "runtime": runtime_service.status(),
         "models": runtime_service.model_statuses(),
     }
@@ -212,7 +378,10 @@ async def admin_create_voice(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
-        temp_path.unlink(missing_ok=True)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 @app.post("/api/admin/voices/transcribe")
@@ -235,7 +404,10 @@ async def admin_transcribe_voice(
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
-        temp_path.unlink(missing_ok=True)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 @app.delete("/api/admin/voices/{voice_id}")
@@ -279,6 +451,45 @@ def public_voices() -> dict[str, Any]:
     return {"voices": runtime_service.list_voices()}
 
 
+@app.get("/v1/models")
+def openai_compatible_models() -> dict[str, Any]:
+    return {"object": "list", "data": _openai_tts_model_payloads()}
+
+
+@app.get("/v1/voices")
+def openai_compatible_voices() -> dict[str, Any]:
+    return {"object": "list", "data": _openai_tts_voice_payloads()}
+
+
+@app.get("/v1/audio/voices")
+def openai_compatible_audio_voices() -> dict[str, Any]:
+    return {"object": "list", "data": _openai_tts_voice_payloads()}
+
+
+@app.post("/v1/audio/speech")
+def openai_compatible_audio_speech(
+    request: OpenAICompatibleSpeechRequest,
+) -> Response:
+    active_model = _coerce_openai_tts_model(request.model)
+    voice_id = _resolve_openai_voice_id(request.voice)
+    try:
+        runtime_service.get_voice(voice_id)
+        state = scheduler.submit_request(text=request.input, voice_id=voice_id)
+        result = scheduler.wait_for_result(state)
+        wav_bytes = _load_generated_audio_bytes(result)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429 if "queue is full" in str(exc).lower() else 500, detail=str(exc)) from exc
+    return _audio_response_from_wav_bytes(
+        wav_bytes,
+        response_format=request.response_format,
+        active_model=active_model,
+    )
+
+
 @app.post("/api/v1/synthesize")
 def public_synthesize(
     request: PublicSynthesizeRequest,
@@ -319,9 +530,19 @@ def public_synthesize_stream(
 @app.get("/api/assets/generated/{file_name}")
 def generated_audio(
     file_name: str,
-) -> FileResponse:
+) -> Response:
     try:
-        path = runtime_service.generated_audio_path(file_name)
+        if hasattr(runtime_service, "generated_audio_asset"):
+            asset = runtime_service.generated_audio_asset(file_name)
+            if asset.get("kind") == "memory":
+                return Response(
+                    content=asset["content"],
+                    media_type="audio/wav",
+                    headers={"Cache-Control": "no-store"},
+                )
+            path = asset["path"]
+        else:
+            path = runtime_service.generated_audio_path(file_name)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return FileResponse(path, media_type="audio/wav", filename=file_name)
@@ -339,9 +560,9 @@ def voice_reference(
     return FileResponse(path, media_type="audio/wav", filename=path.name)
 
 
-@app.get("/{full_path:path}", include_in_schema=False)
+@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"], include_in_schema=False)
 def frontend(full_path: str):
-    if full_path.startswith("api/"):
+    if full_path.startswith("api/") or full_path.startswith("v1/"):
         raise HTTPException(status_code=404, detail="Not found")
 
     if not FRONTEND_DIST.exists():

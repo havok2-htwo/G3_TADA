@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import gc
+import hashlib
 import importlib.util
 import json
 import os
@@ -9,7 +11,8 @@ import threading
 import time
 import types
 import uuid
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -44,6 +47,9 @@ MAX_REFERENCE_AUDIO_SECONDS = 14.5
 DEFAULT_REFERENCE_AUDIO_SECONDS = 10.0
 REFERENCE_TAIL_SILENCE_SECONDS = 0.5
 REFERENCE_TAIL_FADE_OUT_MS = 30
+BENCHMARK_MAX_SOURCE_SECONDS = 14.0
+BENCHMARK_FIXTURES_DIR = Path("tests") / "fixtures" / "benchmark_voices"
+GENERATED_AUDIO_MEMORY_CACHE_LIMIT = 100
 
 AVAILABLE_MODELS: dict[str, dict[str, str]] = {
     "HumeAI/tada-3b-ml": {
@@ -85,6 +91,8 @@ SUPPORTED_LANGUAGES = {
     "pl": "Polish",
     "pt": "Portuguese",
 }
+
+SUPPORTED_MODEL_PRECISIONS = ("fp16", "bf16", "fp32")
 
 
 def slugify(value: str) -> str:
@@ -134,6 +142,33 @@ def save_audio_tensor(path: Path, waveform: torch.Tensor, sample_rate: int) -> N
     if audio.ndim == 1:
         audio = audio.unsqueeze(0)
     sf.write(str(path), audio.transpose(0, 1).numpy(), int(sample_rate))
+
+
+def resample_audio_tensor(waveform: torch.Tensor, *, sample_rate: int, target_sample_rate: int) -> torch.Tensor:
+    audio = waveform.detach().float().cpu().contiguous()
+    if sample_rate == target_sample_rate:
+        return audio
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+    if audio.ndim != 2 or int(audio.shape[-1]) <= 0:
+        raise ValueError("Audio is empty and cannot be resampled.")
+
+    target_length = max(1, int(round(audio.shape[-1] * float(target_sample_rate) / float(sample_rate))))
+    resampled = torch.nn.functional.interpolate(
+        audio.unsqueeze(0),
+        size=target_length,
+        mode="linear",
+        align_corners=False,
+    )
+    return resampled.squeeze(0).contiguous()
+
+
+def audio_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def trim_audio_tensor(
@@ -281,6 +316,13 @@ def _multipart_form_data(fields: dict[str, str], file_field_name: str, file_path
     return line_break.join(parts) + line_break, boundary
 
 
+def _safe_http_error_detail(exc: urllib_error.HTTPError) -> str:
+    try:
+        return exc.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
 @dataclass
 class VoiceRecord:
     voice_id: str
@@ -344,6 +386,7 @@ class BatchGenerationItem:
     voice_id: str
     text: str
     sentence_index: int
+    derived_seed: int | None = None
 
 
 @dataclass
@@ -369,6 +412,40 @@ class BatchPreviewUpdate:
 
 
 @dataclass
+class BenchmarkFixtureRecord:
+    fixture_id: str
+    source_name: str
+    source_path: str
+    source_sha256: str
+    source_duration_seconds: float
+    prepared_duration_seconds: float | None
+    sample_rate: int | None
+    channels: int | None
+    transcript: str | None
+    language: str | None
+    output_path: str | None
+    skipped: bool
+    skip_reason: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fixture_id": self.fixture_id,
+            "source_name": self.source_name,
+            "source_path": self.source_path,
+            "source_sha256": self.source_sha256,
+            "source_duration_seconds": self.source_duration_seconds,
+            "prepared_duration_seconds": self.prepared_duration_seconds,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "transcript": self.transcript,
+            "language": self.language,
+            "output_path": self.output_path,
+            "skipped": self.skipped,
+            "skip_reason": self.skip_reason,
+        }
+
+
+@dataclass
 class _PreviewState:
     item: BatchGenerationItem
     emitted_samples: int = 0
@@ -384,6 +461,8 @@ class TadaRuntimeService:
         self.generated_history_path = self.data_dir / "generated_history.jsonl"
         self.generated_dir = ensure_directory(self.backend_dir / "generated")
         self.offload_dir = ensure_directory(self.backend_dir / "offload")
+        self._generated_audio_cache: OrderedDict[str, bytes] = OrderedDict()
+        self._generated_audio_cache_lock = threading.Lock()
         self.codec_name = os.getenv("TADA_CODEC_NAME", "HumeAI/tada-codec")
         self._encoders: dict[str, Any] = {}
         self._model: Any | None = None
@@ -411,11 +490,9 @@ class TadaRuntimeService:
             )
         )
         self.prompt_device = torch.device("cuda:0" if self.device.type == "cuda" else "cpu")
-        self.model_dtype = (
-            torch.bfloat16
-            if self.device.type == "cuda" and torch.cuda.is_bf16_supported()
-            else torch.float32
-        )
+        initial_settings = self._settings()
+        self.configured_model_precision = initial_settings.model_precision
+        self.model_precision, self.model_dtype = self._resolve_model_precision(initial_settings.model_precision)
         self.enable_cpu_offload = os.getenv("TADA_ENABLE_CPU_OFFLOAD", "0").lower() in {"1", "true", "yes"}
         self.decoder_device = torch.device(
             os.getenv("TADA_DECODER_DEVICE", "cpu" if self.enable_cpu_offload else str(self.device))
@@ -434,6 +511,22 @@ class TadaRuntimeService:
 
     def _settings(self):
         return self.config_store.get_settings()
+
+    def _resolve_model_precision(self, configured_precision: str) -> tuple[str, torch.dtype]:
+        normalized = str(configured_precision or "fp16").strip().lower() or "fp16"
+        if normalized not in SUPPORTED_MODEL_PRECISIONS:
+            raise ValueError(
+                f"Unsupported model precision '{configured_precision}'. Available: {', '.join(SUPPORTED_MODEL_PRECISIONS)}."
+            )
+        if self.device.type != "cuda":
+            return "fp32", torch.float32
+        if normalized == "bf16":
+            if not torch.cuda.is_bf16_supported():
+                raise ValueError("BF16 was requested but this GPU/runtime does not support bfloat16.")
+            return "bf16", torch.bfloat16
+        if normalized == "fp16":
+            return "fp16", torch.float16
+        return "fp32", torch.float32
 
     def _hf_token(self) -> str:
         return self.config_store.get_hf_token() or get_token() or ""
@@ -458,6 +551,8 @@ class TadaRuntimeService:
             "gpu_name": self.gpu_name,
             "gpu_memory_gib": self.gpu_memory_gib,
             "configured_model_name": settings.active_model,
+            "configured_model_precision": settings.model_precision,
+            "effective_model_precision": self.model_precision,
             "loaded_model_name": self._model_name,
             "available_models": self.available_models(),
             "model_loaded": self._model is not None,
@@ -495,6 +590,38 @@ class TadaRuntimeService:
         with self.generated_history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
+    def _has_cached_generated_audio(self, file_name: str) -> bool:
+        with self._generated_audio_cache_lock:
+            return file_name in self._generated_audio_cache
+
+    def _store_generated_audio_in_memory(self, file_name: str, audio: torch.Tensor, sample_rate: int) -> None:
+        buffer = io.BytesIO()
+        clip = audio.detach().float().cpu()
+        if clip.ndim == 1:
+            clip = clip.unsqueeze(0)
+        sf.write(buffer, clip.transpose(0, 1).numpy(), int(sample_rate), format="WAV")
+        with self._generated_audio_cache_lock:
+            self._generated_audio_cache[file_name] = buffer.getvalue()
+            self._generated_audio_cache.move_to_end(file_name)
+            while len(self._generated_audio_cache) > GENERATED_AUDIO_MEMORY_CACHE_LIMIT:
+                self._generated_audio_cache.popitem(last=False)
+
+    def _hydrate_generation_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        hydrated = dict(record)
+        file_name = str(hydrated.get("audio_file_name") or "").strip()
+        audio_storage = str(hydrated.get("audio_storage") or ("disk" if file_name else "")).strip().lower()
+        audio_url = None
+        if file_name:
+            if audio_storage == "disk":
+                if (self.generated_dir / file_name).exists():
+                    audio_url = f"/api/assets/generated/{file_name}"
+            elif audio_storage == "memory":
+                if self._has_cached_generated_audio(file_name):
+                    audio_url = f"/api/assets/generated/{file_name}"
+        hydrated["audio_storage"] = audio_storage or None
+        hydrated["audio_url"] = audio_url
+        return hydrated
+
     def list_recent_generations(self, *, limit: int = 60) -> list[dict[str, Any]]:
         if not self.generated_history_path.exists():
             return []
@@ -505,9 +632,10 @@ class TadaRuntimeService:
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            records.append(self._hydrate_generation_record(record))
             if len(records) >= limit:
                 break
         return records
@@ -544,21 +672,33 @@ class TadaRuntimeService:
             del model
         gc.collect()
         if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
+            try:
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+            except RuntimeError as exc:
+                print(f"Warning: CUDA cache cleanup failed during model disposal: {exc}", flush=True)
 
     def sync_runtime_settings(self) -> None:
         settings = self._settings()
         normalized_model_name = self.normalize_model_name(settings.active_model)
+        desired_precision, desired_dtype = self._resolve_model_precision(settings.model_precision)
         model_to_dispose: Any | None = None
         with self._generation_lock:
             with self._model_lock:
-                if normalized_model_name != self._model_name:
+                precision_changed = (
+                    desired_dtype != self.model_dtype
+                    or desired_precision != self.model_precision
+                    or settings.model_precision != self.configured_model_precision
+                )
+                if normalized_model_name != self._model_name or precision_changed:
                     model_to_dispose = self._model
                     self._model = None
                     self._model_name = normalized_model_name
                     self._model_load_error = None
+                self.configured_model_precision = settings.model_precision
+                self.model_precision = desired_precision
+                self.model_dtype = desired_dtype
             self._dispose_model(model_to_dispose)
 
     def _ensure_runtime_ready(self) -> None:
@@ -780,39 +920,281 @@ class TadaRuntimeService:
         temp_path.parent.mkdir(parents=True, exist_ok=True)
         save_audio_tensor(temp_path, waveform, sample_rate)
         try:
-            form_body, boundary = _multipart_form_data({"model": "whisper-1"}, "file", temp_path)
-            endpoint = f"{base_url}/audio/transcriptions"
-            headers = {
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Accept": "application/json",
-            }
-            whisper_api_key = self.config_store.get_whisper_api_key()
-            if whisper_api_key:
-                headers["Authorization"] = f"Bearer {whisper_api_key}"
+            payload = None
+            final_error: RuntimeError | None = None
+            for endpoint, form_fields in self._whisper_request_candidates(base_url):
+                form_body, boundary = _multipart_form_data(form_fields, "file", temp_path)
+                headers = {
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Accept": "application/json",
+                }
+                whisper_api_key = self.config_store.get_whisper_api_key()
+                if whisper_api_key:
+                    headers["Authorization"] = f"Bearer {whisper_api_key}"
 
-            request = urllib_request.Request(endpoint, data=form_body, headers=headers, method="POST")
-            try:
-                with urllib_request.urlopen(request, timeout=120) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            except urllib_error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="ignore")
-                raise RuntimeError(f"Whisper transcription failed ({exc.code}): {detail or exc.reason}") from exc
-            except urllib_error.URLError as exc:
-                raise RuntimeError(f"Whisper transcription failed: {exc.reason}") from exc
+                request = urllib_request.Request(endpoint, data=form_body, headers=headers, method="POST")
+                try:
+                    with urllib_request.urlopen(request, timeout=120) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                    break
+                except urllib_error.HTTPError as exc:
+                    detail = _safe_http_error_detail(exc)
+                    final_error = RuntimeError(
+                        f"Whisper transcription failed at {endpoint} ({exc.code}): {detail or exc.reason}"
+                    )
+                    if exc.code in {404, 405}:
+                        continue
+                    raise final_error from exc
+                except urllib_error.URLError as exc:
+                    raise RuntimeError(f"Whisper transcription failed at {endpoint}: {exc.reason}") from exc
+
+            if payload is None:
+                raise final_error or RuntimeError("Whisper transcription failed: no compatible endpoint responded.")
         finally:
             temp_path.unlink(missing_ok=True)
 
-        transcript = str(payload.get("text") or "").strip()
+        transcript = str(payload.get("text") or payload.get("transcription") or "").strip()
         if not transcript:
             raise RuntimeError("Whisper returned no transcript text.")
         return {
             "text": transcript,
+            "language": str(payload.get("language") or "").strip() or None,
             "base_url": base_url,
             "trim_start_ms": int(trim_metadata["trim_start_ms"]),
             "trim_end_ms": int(trim_metadata["trim_end_ms"]),
             "duration_seconds": float(trim_metadata["duration_seconds"]),
             "source_duration_seconds": float(trim_metadata["source_duration_seconds"]),
             "was_auto_trimmed": bool(trim_metadata["was_auto_trimmed"]),
+        }
+
+    @staticmethod
+    def _whisper_request_candidates(base_url: str) -> list[tuple[str, dict[str, str]]]:
+        normalized = str(base_url or "").strip().rstrip("/")
+        base_without_v1 = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized
+        candidates: list[tuple[str, dict[str, str]]] = []
+        seen: set[str] = set()
+
+        def add(endpoint: str, fields: dict[str, str]) -> None:
+            if endpoint and endpoint not in seen:
+                candidates.append((endpoint, fields))
+                seen.add(endpoint)
+
+        openai_fields = {"model": "whisper-1"}
+        genesis_fields = {"engine": "local", "voice_ident": "false"}
+
+        add(f"{normalized}/audio/transcriptions", openai_fields)
+        add(f"{base_without_v1}/audio/transcriptions", openai_fields)
+        add(f"{base_without_v1}/v1/audio/transcriptions", openai_fields)
+        add(f"{normalized}/transcribe/", genesis_fields)
+        add(f"{base_without_v1}/transcribe/", genesis_fields)
+        return candidates
+
+    @staticmethod
+    def _normalize_seed_text(text: str) -> str:
+        return " ".join((text or "").split())
+
+    def _derive_batch_item_seed(self, item: BatchGenerationItem, settings: Any) -> int | None:
+        if settings.deterministic_seed is None:
+            return None
+        material = "\x1f".join(
+            [
+                str(settings.deterministic_seed),
+                self.normalize_model_name(settings.active_model),
+                str(settings.model_precision),
+                str(item.voice_id),
+                self._normalize_seed_text(item.text),
+            ]
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+    def _prepare_batch_items(self, items: list[BatchGenerationItem], settings: Any) -> list[BatchGenerationItem]:
+        prepared_items: list[BatchGenerationItem] = []
+        for item in items:
+            prepared_items.append(
+                replace(
+                    item,
+                    derived_seed=item.derived_seed
+                    if item.derived_seed is not None
+                    else self._derive_batch_item_seed(item, settings),
+                )
+            )
+        return prepared_items
+
+    def build_benchmark_corpus(
+        self,
+        *,
+        source_dir: Path | None = None,
+        output_dir: Path | None = None,
+        mode: str = "full",
+    ) -> dict[str, Any]:
+        normalized_mode = str(mode or "full").strip().lower() or "full"
+        if normalized_mode not in {"smoke", "full"}:
+            raise ValueError("Benchmark corpus mode must be 'smoke' or 'full'.")
+
+        source_root = (source_dir or (self.project_root / "voices")).resolve(strict=False)
+        if not source_root.exists():
+            raise FileNotFoundError(f"Benchmark source directory '{source_root}' was not found.")
+
+        fixtures_root = (output_dir or (self.project_root / BENCHMARK_FIXTURES_DIR)).resolve(strict=False)
+        fixtures_root.mkdir(parents=True, exist_ok=True)
+        manifest_path = fixtures_root / "manifest.json"
+        cached_manifest = safe_json_load(manifest_path) if manifest_path.exists() else {}
+        cached_by_hash: dict[str, dict[str, Any]] = {}
+        for entry in cached_manifest.get("entries", []):
+            source_hash = str(entry.get("source_sha256") or "")
+            if source_hash:
+                cached_by_hash[source_hash] = entry
+
+        discovered: list[dict[str, Any]] = []
+        selected_candidates: list[dict[str, Any]] = []
+        for source_path in sorted(source_root.iterdir(), key=lambda item: item.name.lower()):
+            if not source_path.is_file():
+                continue
+            source_hash = audio_file_sha256(source_path)
+            try:
+                waveform, sample_rate = load_audio_tensor(source_path)
+            except Exception as exc:
+                discovered.append(
+                    BenchmarkFixtureRecord(
+                        fixture_id=source_path.stem,
+                        source_name=source_path.name,
+                        source_path=str(source_path.relative_to(self.project_root)),
+                        source_sha256=source_hash,
+                        source_duration_seconds=0.0,
+                        prepared_duration_seconds=None,
+                        sample_rate=None,
+                        channels=None,
+                        transcript=None,
+                        language=None,
+                        output_path=None,
+                        skipped=True,
+                        skip_reason=f"decode_error: {exc}",
+                    ).to_dict()
+                )
+                continue
+
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            source_duration_seconds = round(float(waveform.shape[-1]) / float(sample_rate), 4)
+            channels = int(waveform.shape[0])
+            base_record = {
+                "fixture_id": source_path.stem,
+                "source_name": source_path.name,
+                "source_path": str(source_path.relative_to(self.project_root)),
+                "source_sha256": source_hash,
+                "source_duration_seconds": source_duration_seconds,
+                "sample_rate": int(sample_rate),
+                "channels": channels,
+                "waveform": waveform,
+            }
+            if source_duration_seconds < MIN_REFERENCE_AUDIO_SECONDS:
+                discovered.append(
+                    BenchmarkFixtureRecord(
+                        prepared_duration_seconds=None,
+                        transcript=None,
+                        language=None,
+                        output_path=None,
+                        skipped=True,
+                        skip_reason="duration_below_minimum",
+                        **{key: base_record[key] for key in ("fixture_id", "source_name", "source_path", "source_sha256", "source_duration_seconds", "sample_rate", "channels")},
+                    ).to_dict()
+                )
+                continue
+            if source_duration_seconds >= BENCHMARK_MAX_SOURCE_SECONDS:
+                discovered.append(
+                    BenchmarkFixtureRecord(
+                        prepared_duration_seconds=None,
+                        transcript=None,
+                        language=None,
+                        output_path=None,
+                        skipped=True,
+                        skip_reason="duration_at_or_above_limit",
+                        **{key: base_record[key] for key in ("fixture_id", "source_name", "source_path", "source_sha256", "source_duration_seconds", "sample_rate", "channels")},
+                    ).to_dict()
+                )
+                continue
+            selected_candidates.append(base_record)
+
+        if normalized_mode == "smoke":
+            selected_candidates = selected_candidates[:10]
+
+        selected_hashes = {candidate["source_sha256"] for candidate in selected_candidates}
+        entries: list[dict[str, Any]] = [entry for entry in discovered if entry["source_sha256"] not in selected_hashes]
+
+        for candidate in selected_candidates:
+            source_path = source_root / candidate["source_name"]
+            waveform = candidate["waveform"]
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            waveform = waveform.clamp(-1.0, 1.0)
+            trimmed, _ = trim_audio_tensor(
+                waveform,
+                sample_rate=int(candidate["sample_rate"]),
+                min_duration_seconds=MIN_REFERENCE_AUDIO_SECONDS,
+                max_duration_seconds=BENCHMARK_MAX_SOURCE_SECONDS,
+            )
+            resampled = resample_audio_tensor(trimmed, sample_rate=int(candidate["sample_rate"]), target_sample_rate=24000)
+            prepared, _ = prepare_reference_prompt_audio(resampled, sample_rate=24000)
+            prepared_duration_seconds = round(float(prepared.shape[-1]) / 24000.0, 4)
+            fixture_file_name = f"{slugify(Path(candidate['fixture_id']).stem)}-{candidate['source_sha256'][:8]}.wav"
+            fixture_path = fixtures_root / fixture_file_name
+            save_audio_tensor(fixture_path, prepared, 24000)
+
+            cached_entry = cached_by_hash.get(candidate["source_sha256"], {})
+            transcript = str(cached_entry.get("transcript") or "").strip() or None
+            language = str(cached_entry.get("language") or "").strip() or None
+            skipped = False
+            skip_reason = None
+
+            if not transcript:
+                try:
+                    transcript_payload = self.transcribe_audio(upload_path=source_path)
+                    transcript = str(transcript_payload.get("text") or "").strip() or None
+                    language = str(transcript_payload.get("language") or "").strip() or None
+                except Exception as exc:
+                    skipped = True
+                    skip_reason = f"transcription_failed: {exc}"
+
+            if not transcript:
+                skipped = True
+                skip_reason = skip_reason or "empty_transcript"
+
+            entries.append(
+                BenchmarkFixtureRecord(
+                    fixture_id=candidate["fixture_id"],
+                    source_name=candidate["source_name"],
+                    source_path=candidate["source_path"],
+                    source_sha256=candidate["source_sha256"],
+                    source_duration_seconds=float(candidate["source_duration_seconds"]),
+                    prepared_duration_seconds=prepared_duration_seconds,
+                    sample_rate=24000,
+                    channels=1,
+                    transcript=transcript,
+                    language=language,
+                    output_path=str(fixture_path.relative_to(self.project_root)),
+                    skipped=skipped,
+                    skip_reason=skip_reason,
+                ).to_dict()
+            )
+
+        entries.sort(key=lambda item: item["source_name"].lower())
+        manifest = {
+            "generated_at": now_iso(),
+            "mode": normalized_mode,
+            "source_dir": str(source_root.relative_to(self.project_root)),
+            "output_dir": str(fixtures_root.relative_to(self.project_root)),
+            "entries": entries,
+        }
+        safe_json_dump(manifest_path, manifest)
+        prepared_entries = [entry for entry in entries if not entry["skipped"]]
+        skipped_entries = [entry for entry in entries if entry["skipped"]]
+        return {
+            "manifest_path": str(manifest_path),
+            "entries": entries,
+            "prepared_count": len(prepared_entries),
+            "skipped_count": len(skipped_entries),
+            "mode": normalized_mode,
         }
 
     def _prompt_path_for_voice(self, voice_id: str) -> Path:
@@ -832,15 +1214,32 @@ class TadaRuntimeService:
             return []
 
         settings = self._settings()
+        voice_ids = {item.voice_id for item in items}
+        if len(voice_ids) != 1:
+            raise RuntimeError(
+                "Mixed-voice batching is disabled in the hardened runtime. Please batch only a single voice_id at a time."
+            )
+
+        prepared_items = self._prepare_batch_items(items, settings)
         prompts = []
-        preview_states = {item.request_id: _PreviewState(item=item) for item in items}
+        preview_states = {
+            (item.request_id, item.sentence_index): _PreviewState(item=item) for item in prepared_items
+        }
         with self._generation_lock:
             model = self._load_model()
-            for item in items:
+            for item in prepared_items:
                 prompt_path = self._prompt_path_for_voice(item.voice_id)
                 prompts.append(EncoderOutput.load(str(prompt_path), device=str(self.prompt_device)))
             merged_prompt = merge_encoder_outputs(prompts)
-            options = InferenceOptions(num_flow_matching_steps=int(settings.steps))
+            options = InferenceOptions(
+                num_flow_matching_steps=int(settings.steps),
+                item_seeds=[item.derived_seed for item in prepared_items],
+                vad_trimming=bool(settings.vad_trimming),
+                prompt_start_trim_steps=int(settings.prompt_start_trim_steps),
+                vad_threshold_pct=float(settings.vad_threshold_pct),
+                vad_padding_ms=int(settings.vad_padding_ms),
+                vad_fade_ms=int(settings.vad_fade_ms),
+            )
             sample_rate = self._output_sample_rate(model)
             buffer_samples = max(0, int(sample_rate * settings.stream_start_buffer_ms / 1000))
             min_emit_samples = max(1, int(sample_rate * 0.2))
@@ -857,12 +1256,13 @@ class TadaRuntimeService:
                 if encoded_batch.ndim < 3 or time_before_batch.ndim < 2:
                     return
 
-                batch_size = min(int(encoded_batch.shape[0]), int(time_before_batch.shape[0]), len(items))
+                batch_size = min(int(encoded_batch.shape[0]), int(time_before_batch.shape[0]), len(prepared_items))
                 if isinstance(input_lengths, torch.Tensor) and input_lengths.ndim >= 1:
                     batch_size = min(batch_size, int(input_lengths.shape[0]))
                 progress_step = int(update.get("step", -1))
                 for batch_index in range(batch_size):
-                    preview_state = preview_states[items[batch_index].request_id]
+                    preview_item = prepared_items[batch_index]
+                    preview_state = preview_states[(preview_item.request_id, preview_item.sentence_index)]
                     input_length = None
                     if isinstance(input_lengths, torch.Tensor):
                         input_length = int(input_lengths[batch_index].item())
@@ -895,7 +1295,7 @@ class TadaRuntimeService:
             with torch.inference_mode():
                 output = model.generate(
                     prompt=merged_prompt,
-                    text=[item.text for item in items],
+                    text=[item.text for item in prepared_items],
                     inference_options=options,
                     progress_callback=progress_callback if on_preview is not None else None,
                     progress_interval_steps=DEFAULT_PROGRESS_INTERVAL_STEPS,
@@ -905,7 +1305,7 @@ class TadaRuntimeService:
             raise RuntimeError("TADA returned no waveform batch.")
 
         results: list[BatchGenerationResult] = []
-        for index, item in enumerate(items):
+        for index, item in enumerate(prepared_items):
             audio = output.audio[index]
             if audio is None:
                 raise RuntimeError(f"TADA returned no waveform for request {item.request_id}.")
@@ -941,19 +1341,15 @@ class TadaRuntimeService:
     ) -> torch.Tensor | None:
         if encoded.ndim != 2 or encoded.shape[0] <= 0 or time_before.ndim != 1 or time_before.shape[0] <= 1:
             return None
-        valid_encoded = encoded
-        valid_time_before = time_before
-        if input_length is not None:
-            keep_len = max(1, int(input_length) + 2 - int(stream_offset))
-            keep_len = min(keep_len, int(encoded.shape[0]), int(time_before.shape[0]))
-            valid_encoded = encoded[:keep_len]
-            valid_time_before = time_before[:keep_len]
         try:
-            wav = model._decode_wav(valid_encoded, time_before=valid_time_before).squeeze(0, 1)
+            # Progress updates already contain only the currently generated window.
+            # Re-applying an input-length-based cap here can prematurely cut previews
+            # and leave the sentence tail missing until the final chunk lands.
+            wav = model._decode_wav(encoded, time_before=time_before).squeeze(0, 1)
         except Exception:
             return None
 
-        lead_samples = int(sample_rate * float(valid_time_before[0].item()) / 50.0) if int(valid_time_before.shape[0]) > 0 else 0
+        lead_samples = int(sample_rate * float(time_before[0].item()) / 50.0) if int(time_before.shape[0]) > 0 else 0
         if lead_samples > 0:
             wav = wav[..., lead_samples:]
         audio = wav.detach().float().cpu().reshape(-1)
@@ -984,9 +1380,15 @@ class TadaRuntimeService:
         sentence_count: int,
         batch_count: int,
     ) -> dict[str, Any]:
+        settings = self._settings()
         generation_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        audio_path = self.generated_dir / f"{generation_id}.wav"
-        save_audio_tensor(audio_path, audio, sample_rate)
+        asset_name = f"{generation_id}.wav"
+        audio_path = self.generated_dir / asset_name
+        audio_storage = "disk" if settings.persist_generated_wavs else "memory"
+        if settings.persist_generated_wavs:
+            save_audio_tensor(audio_path, audio, sample_rate)
+        else:
+            self._store_generated_audio_in_memory(asset_name, audio, sample_rate)
         duration_seconds = round(float(audio.shape[-1]) / float(sample_rate), 2)
         total_wall_seconds = round(total_wall_ms / 1000.0, 2)
         rtf = round(total_wall_seconds / duration_seconds, 2) if duration_seconds > 0 else 0.0
@@ -1001,8 +1403,9 @@ class TadaRuntimeService:
             "text": request_text,
             "voice_id": voice_id,
             "voice_name": voice_name,
-            "audio_url": f"/api/assets/generated/{audio_path.name}",
-            "audio_file_name": audio_path.name,
+            "audio_url": f"/api/assets/generated/{asset_name}",
+            "audio_file_name": asset_name,
+            "audio_storage": audio_storage,
             "sample_rate": sample_rate,
             "duration_seconds": duration_seconds,
             "processing_time": total_wall_seconds,
@@ -1017,6 +1420,17 @@ class TadaRuntimeService:
         }
         self._append_generation_history(result)
         return result
+
+    def generated_audio_asset(self, file_name: str) -> dict[str, Any]:
+        path = self.generated_dir / file_name
+        if path.exists():
+            return {"kind": "file", "path": path}
+        with self._generated_audio_cache_lock:
+            payload = self._generated_audio_cache.get(file_name)
+            if payload is not None:
+                self._generated_audio_cache.move_to_end(file_name)
+                return {"kind": "memory", "content": payload}
+        raise FileNotFoundError(f"Generated audio '{file_name}' was not found.")
 
     def generated_audio_path(self, file_name: str) -> Path:
         path = self.generated_dir / file_name

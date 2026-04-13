@@ -6,7 +6,6 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -14,6 +13,8 @@ import torch
 from backend.config_store import ConfigStore, now_iso
 from backend.prompt_batch import chunk_waveform, split_sentences
 from backend.runtime_service import BatchGenerationItem, BatchGenerationResult, BatchPreviewUpdate, TadaRuntimeService
+
+DASHBOARD_REFRESH_SECONDS = 0.5
 
 
 @dataclass
@@ -26,25 +27,44 @@ class SynthesisRequestState:
     created_perf: float
     event_queue: queue.Queue[dict[str, Any]] = field(default_factory=queue.Queue)
     done_event: threading.Event = field(default_factory=threading.Event)
-    next_sentence_index: int = 0
+    pending_sentence_indices: deque[int] = field(init=False)
+    inflight_sentence_indices: set[int] = field(default_factory=set)
+    next_emit_sentence_index: int = 0
     sample_rate: int | None = None
-    sentence_waveforms: list[torch.Tensor] = field(default_factory=list)
+    sentence_waveforms: dict[int, torch.Tensor] = field(default_factory=dict)
     first_chunk_perf: float | None = None
     admitted_perf: float | None = None
     finished_perf: float | None = None
     batch_count: int = 0
     total_chunks: int = 0
-    active_sentence_emitted_samples: int = 0
-    active_sentence_chunk_index: int = 0
+    emitted_total_samples: int = 0
+    emitted_samples_by_sentence: dict[int, int] = field(default_factory=dict)
+    chunk_index_by_sentence: dict[int, int] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
+
+    def __post_init__(self) -> None:
+        self.pending_sentence_indices = deque(range(len(self.sentences)))
+
+    def has_pending_sentences(self) -> bool:
+        return bool(self.pending_sentence_indices)
+
+    def is_complete(self) -> bool:
+        return (
+            len(self.sentence_waveforms) >= len(self.sentences)
+            and not self.pending_sentence_indices
+            and not self.inflight_sentence_indices
+            and self.next_emit_sentence_index >= len(self.sentences)
+        )
 
     def summary(self, *, now_perf: float) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
             "voice_id": self.voice_id,
-            "sentence_index": self.next_sentence_index,
+            "sentence_index": self.next_emit_sentence_index,
             "sentence_count": len(self.sentences),
+            "pending_sentences": len(self.pending_sentence_indices),
+            "inflight_sentences": len(self.inflight_sentence_indices),
             "age_ms": round((now_perf - self.created_perf) * 1000.0, 2),
             "batches": self.batch_count,
         }
@@ -66,12 +86,14 @@ class BatchScheduler:
         self._completed_requests = 0
         self._failed_requests = 0
         self._last_snapshot_audio_total = 0.0
+        self._last_snapshot_perf = time.perf_counter()
         self._last_snapshot_completed = 0
         self._last_snapshot_failed = 0
         self._last_batch_stats: dict[str, Any] = {"batch_wall_s": 0.0, "batch_rtf": 0.0, "batch_size": 0}
         self._latest_snapshot: dict[str, Any] = {
             "timestamp": now_iso(),
             "queue_length": 0,
+            "queued_sentence_count": 0,
             "active_request_count": 0,
             "waiting_requests": [],
             "active_requests": [],
@@ -130,6 +152,7 @@ class BatchScheduler:
                     "request_id": state.request_id,
                     "queue_position": len(self._waiting),
                     "active_requests": len(self._active),
+                    "queued_sentences": self._queued_sentence_count_locked(),
                 }
             )
             self._condition.notify_all()
@@ -159,7 +182,12 @@ class BatchScheduler:
     def iter_dashboard_events(self):
         while not self._stop_event.is_set():
             yield self.dashboard_snapshot()
-            time.sleep(1.0)
+            time.sleep(DASHBOARD_REFRESH_SECONDS)
+
+    def _queued_sentence_count_locked(self) -> int:
+        return sum(len(state.pending_sentence_indices) for state in self._waiting) + sum(
+            len(state.pending_sentence_indices) for state in self._active
+        )
 
     def _promote_waiting_locked(self, settings) -> None:
         while self._waiting and len(self._active) < settings.max_parallel_requests:
@@ -172,8 +200,95 @@ class BatchScheduler:
                     "request_id": state.request_id,
                     "queue_position": 0,
                     "active_requests": len(self._active),
+                    "queued_sentences": self._queued_sentence_count_locked(),
                 }
             )
+
+    @staticmethod
+    def _select_voice_only_batch(active_states: list[SynthesisRequestState], max_batch_size: int) -> list[SynthesisRequestState]:
+        if not active_states or max_batch_size <= 0:
+            return []
+        anchor_voice_id = next((state.voice_id for state in active_states if state.has_pending_sentences()), None)
+        if anchor_voice_id is None:
+            return []
+        selected: list[SynthesisRequestState] = []
+        for state in active_states:
+            if state.voice_id != anchor_voice_id or not state.has_pending_sentences():
+                continue
+            selected.append(state)
+            if len(selected) >= max_batch_size:
+                break
+        return selected
+
+    @classmethod
+    def _build_sentence_batch_plan(
+        cls,
+        active_states: list[SynthesisRequestState],
+        max_batch_size: int,
+    ) -> list[tuple[SynthesisRequestState, int]]:
+        voice_states = cls._select_voice_only_batch(active_states, max_batch_size)
+        if not voice_states:
+            return []
+
+        plan: list[tuple[SynthesisRequestState, int]] = []
+        per_request_offsets: dict[str, int] = {state.request_id: 0 for state in voice_states}
+        made_progress = True
+        while len(plan) < max_batch_size and made_progress:
+            made_progress = False
+            for state in voice_states:
+                local_offset = per_request_offsets[state.request_id]
+                if local_offset >= len(state.pending_sentence_indices):
+                    continue
+                plan.append((state, state.pending_sentence_indices[local_offset]))
+                per_request_offsets[state.request_id] = local_offset + 1
+                made_progress = True
+                if len(plan) >= max_batch_size:
+                    break
+        return plan
+
+    def _reserve_sentence_batch_locked(
+        self,
+        batch_plan: list[tuple[SynthesisRequestState, int]],
+    ) -> tuple[list[BatchGenerationItem], list[SynthesisRequestState]]:
+        selected_by_request: dict[str, list[int]] = {}
+        states_by_request: dict[str, SynthesisRequestState] = {}
+        request_order: list[str] = []
+        for state, sentence_index in batch_plan:
+            if state.request_id not in selected_by_request:
+                selected_by_request[state.request_id] = []
+                states_by_request[state.request_id] = state
+                request_order.append(state.request_id)
+            selected_by_request[state.request_id].append(sentence_index)
+
+        reserved_by_request: dict[str, deque[int]] = {}
+        batch_states = [states_by_request[request_id] for request_id in request_order]
+        for request_id in request_order:
+            state = states_by_request[request_id]
+            expected_indices = selected_by_request[request_id]
+            reserved_indices: list[int] = []
+            for expected in expected_indices:
+                actual = state.pending_sentence_indices.popleft()
+                if actual != expected:
+                    raise RuntimeError(
+                        f"Sentence queue order drifted for request {request_id}: expected {expected}, got {actual}."
+                    )
+                state.inflight_sentence_indices.add(actual)
+                reserved_indices.append(actual)
+            state.batch_count += 1
+            reserved_by_request[request_id] = deque(reserved_indices)
+
+        batch_items: list[BatchGenerationItem] = []
+        for state, _ in batch_plan:
+            sentence_index = reserved_by_request[state.request_id].popleft()
+            batch_items.append(
+                BatchGenerationItem(
+                    request_id=state.request_id,
+                    voice_id=state.voice_id,
+                    text=state.sentences[sentence_index],
+                    sentence_index=sentence_index,
+                )
+            )
+        return batch_items, batch_states
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -197,20 +312,18 @@ class BatchScheduler:
                         continue
 
                 batch_id = uuid.uuid4().hex[:8]
-                batch_states = list(self._active[: settings.max_batch_size])
-                batch_items = [
-                    BatchGenerationItem(
-                        request_id=state.request_id,
-                        voice_id=state.voice_id,
-                        text=state.sentences[state.next_sentence_index],
-                        sentence_index=state.next_sentence_index,
-                    )
-                    for state in batch_states
-                ]
+                batch_plan = self._build_sentence_batch_plan(self._active, settings.max_batch_size)
+                if not batch_plan:
+                    self._condition.wait(timeout=0.05)
+                    continue
+
+                batch_items, batch_states = self._reserve_sentence_batch_locked(batch_plan)
                 self._current_batch = {
                     "batch_id": batch_id,
                     "started_at": now_iso(),
                     "size": len(batch_items),
+                    "voice_id": batch_items[0].voice_id if batch_items else None,
+                    "request_ids": [item.request_id for item in batch_items],
                     "items": [
                         {
                             "request_id": item.request_id,
@@ -221,8 +334,11 @@ class BatchScheduler:
                         for item in batch_items
                     ],
                 }
-                for state, item in zip(batch_states, batch_items):
-                    state.batch_count += 1
+                state_by_request = {state.request_id: state for state in batch_states}
+                selected_indices_by_request: dict[str, list[int]] = {}
+                for item in batch_items:
+                    state = state_by_request[item.request_id]
+                    selected_indices_by_request.setdefault(item.request_id, []).append(item.sentence_index)
                     state.event_queue.put(
                         {
                             "type": "batch",
@@ -230,14 +346,15 @@ class BatchScheduler:
                             "batch_id": batch_id,
                             "sentence_index": item.sentence_index,
                             "batch_size": len(batch_items),
+                            "batch_voice_id": item.voice_id,
                         }
                     )
                 batch_started_perf = time.perf_counter()
 
             def on_preview(update: BatchPreviewUpdate) -> None:
                 with self._condition:
-                    state = next((candidate for candidate in batch_states if candidate.request_id == update.request_id), None)
-                    if state is None or state.error or state.next_sentence_index != update.sentence_index:
+                    state = state_by_request.get(update.request_id)
+                    if state is None or state.error or state.next_emit_sentence_index != update.sentence_index:
                         return
                     self._emit_audio_chunks_locked(
                         state,
@@ -266,19 +383,21 @@ class BatchScheduler:
 
             batch_wall_seconds = max(0.0, time.perf_counter() - batch_started_perf)
             batch_audio_seconds = sum(result.duration_seconds for result in results)
-            results_by_request = {result.request_id: result for result in results}
+            results_by_sentence = {(result.request_id, result.sentence_index): result for result in results}
 
             with self._condition:
                 self._current_batch = None
                 for state in batch_states:
-                    result = results_by_request.get(state.request_id)
-                    if result is None:
+                    selected_indices = sorted(selected_indices_by_request.get(state.request_id, []))
+                    if any((state.request_id, sentence_index) not in results_by_sentence for sentence_index in selected_indices):
                         self._fail_request_locked(state, "Batch result was incomplete.")
                         if state in self._active:
                             self._active.remove(state)
                         continue
-                    self._apply_sentence_result_locked(state, result)
-                    if state.next_sentence_index >= len(state.sentences):
+                    for sentence_index in selected_indices:
+                        result = results_by_sentence[(state.request_id, sentence_index)]
+                        self._apply_sentence_result_locked(state, result)
+                    if state.is_complete():
                         self._complete_request_locked(state)
                         if state in self._active:
                             self._active.remove(state)
@@ -292,21 +411,28 @@ class BatchScheduler:
 
     def _apply_sentence_result_locked(self, state: SynthesisRequestState, result: BatchGenerationResult) -> None:
         state.sample_rate = result.sample_rate
-        state.sentence_waveforms.append(result.waveform)
-        final_mono = result.waveform.detach().float().cpu().reshape(-1)
-        remaining = final_mono[state.active_sentence_emitted_samples :]
-        self._emit_audio_chunks_locked(
-            state,
-            waveform=remaining,
-            sample_rate=result.sample_rate,
-            sentence_index=result.sentence_index,
-            progress_step=-1,
-            preview=False,
-            final_chunk_of_sentence=True,
-        )
-        state.active_sentence_emitted_samples = 0
-        state.active_sentence_chunk_index = 0
-        state.next_sentence_index += 1
+        state.inflight_sentence_indices.discard(result.sentence_index)
+        state.sentence_waveforms[result.sentence_index] = result.waveform
+        self._flush_ready_sentences_locked(state)
+
+    def _flush_ready_sentences_locked(self, state: SynthesisRequestState) -> None:
+        while state.next_emit_sentence_index in state.sentence_waveforms:
+            sentence_index = state.next_emit_sentence_index
+            final_mono = state.sentence_waveforms[sentence_index].detach().float().cpu().reshape(-1)
+            emitted_samples = state.emitted_samples_by_sentence.get(sentence_index, 0)
+            remaining = final_mono[emitted_samples:]
+            self._emit_audio_chunks_locked(
+                state,
+                waveform=remaining,
+                sample_rate=state.sample_rate or 24000,
+                sentence_index=sentence_index,
+                progress_step=-1,
+                preview=False,
+                final_chunk_of_sentence=True,
+            )
+            state.emitted_samples_by_sentence.pop(sentence_index, None)
+            state.chunk_index_by_sentence.pop(sentence_index, None)
+            state.next_emit_sentence_index += 1
 
     def _emit_audio_chunks_locked(
         self,
@@ -323,9 +449,8 @@ class BatchScheduler:
             return
         settings = self.config_store.get_settings()
         chunks = chunk_waveform(waveform, sample_rate=sample_rate, chunk_ms=settings.stream_chunk_ms)
-        completed_waveforms = state.sentence_waveforms if preview else state.sentence_waveforms[:-1]
-        completed_samples = sum(int(item.shape[-1]) for item in completed_waveforms)
-        emitted_so_far_ms = float(completed_samples + state.active_sentence_emitted_samples) / float(sample_rate) * 1000.0
+        emitted_so_far_ms = float(state.emitted_total_samples) / float(sample_rate) * 1000.0
+        base_chunk_index = state.chunk_index_by_sentence.get(sentence_index, 0)
         for local_index, chunk in enumerate(chunks):
             state.total_chunks += 1
             if state.first_chunk_perf is None:
@@ -333,7 +458,7 @@ class BatchScheduler:
                 self._recent_ttfts.append((state.first_chunk_perf, (state.first_chunk_perf - state.created_perf) * 1000.0))
             chunk_ms = float(chunk.shape[-1]) / float(sample_rate) * 1000.0
             emitted_so_far_ms += chunk_ms
-            chunk_index = state.active_sentence_chunk_index + local_index
+            chunk_index = base_chunk_index + local_index
             state.event_queue.put(
                 {
                     "type": "chunk",
@@ -348,12 +473,16 @@ class BatchScheduler:
                     "preview": preview,
                 }
             )
-        state.active_sentence_emitted_samples += int(waveform.numel())
-        state.active_sentence_chunk_index += len(chunks)
+        emitted_samples = int(waveform.numel())
+        state.emitted_total_samples += emitted_samples
+        state.emitted_samples_by_sentence[sentence_index] = (
+            state.emitted_samples_by_sentence.get(sentence_index, 0) + emitted_samples
+        )
+        state.chunk_index_by_sentence[sentence_index] = base_chunk_index + len(chunks)
 
     def _complete_request_locked(self, state: SynthesisRequestState) -> None:
         state.finished_perf = time.perf_counter()
-        final_audio = torch.cat(state.sentence_waveforms, dim=-1)
+        final_audio = torch.cat([state.sentence_waveforms[index] for index in range(len(state.sentences))], dim=-1)
         ttft_ms = (state.first_chunk_perf - state.created_perf) * 1000.0 if state.first_chunk_perf is not None else None
         total_wall_ms = (state.finished_perf - state.created_perf) * 1000.0
         state.result = self.runtime_service.save_request_audio(
@@ -379,13 +508,14 @@ class BatchScheduler:
 
     def _metrics_loop(self) -> None:
         while not self._stop_event.is_set():
-            time.sleep(1.0)
+            time.sleep(DASHBOARD_REFRESH_SECONDS)
             with self._lock:
                 snapshot = self._build_dashboard_snapshot_locked()
                 self._history.append(
                     {
                         "timestamp": snapshot["timestamp"],
                         "queue_length": snapshot["queue_length"],
+                        "queued_sentence_count": snapshot["queued_sentence_count"],
                         "active_requests": snapshot["active_request_count"],
                         "batch_size": snapshot["current_batch"]["size"] if snapshot["current_batch"] else 0,
                         "throughput_audio_sps": snapshot["throughput_audio_sps"],
@@ -400,15 +530,18 @@ class BatchScheduler:
         now_perf = time.perf_counter()
         valid_ttfts = [value for timestamp, value in self._recent_ttfts if now_perf - timestamp <= 600.0]
         mean_ttft_ms = round(sum(valid_ttfts) / len(valid_ttfts), 2) if valid_ttfts else None
-        throughput_audio_sps = round(self._total_audio_seconds - self._last_snapshot_audio_total, 3)
+        elapsed_s = max(0.001, now_perf - self._last_snapshot_perf)
+        throughput_audio_sps = round((self._total_audio_seconds - self._last_snapshot_audio_total) / elapsed_s, 3)
         completed_delta = self._completed_requests - self._last_snapshot_completed
         failed_delta = self._failed_requests - self._last_snapshot_failed
         self._last_snapshot_audio_total = self._total_audio_seconds
+        self._last_snapshot_perf = now_perf
         self._last_snapshot_completed = self._completed_requests
         self._last_snapshot_failed = self._failed_requests
         return {
             "timestamp": now_iso(),
             "queue_length": len(self._waiting),
+            "queued_sentence_count": self._queued_sentence_count_locked(),
             "active_request_count": len(self._active),
             "waiting_requests": [state.summary(now_perf=now_perf) for state in list(self._waiting)[:32]],
             "active_requests": [state.summary(now_perf=now_perf) for state in self._active],
