@@ -24,7 +24,7 @@ import torch
 from huggingface_hub import get_token, snapshot_download
 
 from backend.config_store import ConfigStore, now_iso
-from backend.hf_cache import resolve_cached_snapshot, resolve_pretrained_source
+from backend.hf_cache import resolve_cached_repo_root, resolve_cached_snapshot, resolve_pretrained_source
 from backend.prompt_batch import ensure_directory, merge_encoder_outputs
 
 try:
@@ -62,11 +62,11 @@ AVAILABLE_MODELS: dict[str, dict[str, str]] = {
     },
 }
 
-MODEL_DOWNLOAD_TARGETS: dict[str, dict[str, str]] = {
-    "HumeAI/tada-3b-ml": {"label": "TADA 3B ML", "kind": "model"},
-    "HumeAI/tada-1b": {"label": "TADA 1B", "kind": "model"},
-    "HumeAI/tada-codec": {"label": "TADA Codec", "kind": "codec"},
-    "meta-llama/Llama-3.2-1B": {"label": "Meta Llama 3.2 1B Tokenizer", "kind": "tokenizer"},
+MODEL_DOWNLOAD_TARGETS: dict[str, dict[str, Any]] = {
+    "HumeAI/tada-3b-ml": {"label": "TADA 3B ML", "kind": "model", "approx_size_gb": 6.5},
+    "HumeAI/tada-1b": {"label": "TADA 1B", "kind": "model", "approx_size_gb": 2.3},
+    "HumeAI/tada-codec": {"label": "TADA Codec", "kind": "codec", "approx_size_gb": 0.6},
+    "meta-llama/Llama-3.2-1B": {"label": "Meta Llama 3.2 1B Tokenizer", "kind": "tokenizer", "approx_size_gb": 2.4},
 }
 
 MODEL_NAME_ALIASES = {
@@ -93,6 +93,7 @@ SUPPORTED_LANGUAGES = {
 }
 
 SUPPORTED_MODEL_PRECISIONS = ("fp16", "bf16", "fp32")
+BYTES_PER_GB = 1024 ** 3
 
 
 def slugify(value: str) -> str:
@@ -104,6 +105,29 @@ def slugify(value: str) -> str:
 
 def normalize_voice_name(value: str) -> str:
     return " ".join(value.strip().split()).casefold()
+
+
+def _resolve_storage_root(project_root: Path, storage_path: str) -> Path:
+    path = Path(storage_path).expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    return path.resolve(strict=False)
+
+
+def _directory_size_gb(path: Path | None) -> float | None:
+    if path is None or not path.exists():
+        return None
+
+    total_bytes = 0
+    for current_root, _, files in os.walk(path):
+        for file_name in files:
+            file_path = Path(current_root) / file_name
+            try:
+                total_bytes += file_path.stat().st_size
+            except OSError:
+                continue
+
+    return round(total_bytes / BYTES_PER_GB, 2)
 
 
 class DuplicateVoiceNameError(ValueError):
@@ -471,7 +495,7 @@ class TadaRuntimeService:
         self._generation_lock = threading.Lock()
         self._model_load_error: str | None = None
         self._download_lock = threading.Lock()
-        self._download_jobs: dict[str, dict[str, Any]] = {}
+        self._download_jobs: dict[tuple[str, str], dict[str, Any]] = {}
 
         if torch.cuda.is_available():
             self.device = torch.device(os.getenv("TADA_DEVICE", "cuda:0"))
@@ -493,6 +517,7 @@ class TadaRuntimeService:
         initial_settings = self._settings()
         self.configured_model_precision = initial_settings.model_precision
         self.model_precision, self.model_dtype = self._resolve_model_precision(initial_settings.model_precision)
+        self._apply_env_vars(initial_settings)
         self.enable_cpu_offload = os.getenv("TADA_ENABLE_CPU_OFFLOAD", "0").lower() in {"1", "true", "yes"}
         self.decoder_device = torch.device(
             os.getenv("TADA_DECODER_DEVICE", "cpu" if self.enable_cpu_offload else str(self.device))
@@ -679,8 +704,21 @@ class TadaRuntimeService:
             except RuntimeError as exc:
                 print(f"Warning: CUDA cache cleanup failed during model disposal: {exc}", flush=True)
 
+    def _apply_env_vars(self, settings) -> None:
+        if settings.model_storage_path:
+            os.environ["TADA_MODEL_STORAGE_PATH"] = str(Path(settings.model_storage_path).expanduser().resolve(strict=False))
+        elif "TADA_MODEL_STORAGE_PATH" in os.environ:
+            del os.environ["TADA_MODEL_STORAGE_PATH"]
+            
+        token = self._hf_token()
+        if token:
+            os.environ["HF_TOKEN"] = token
+        elif "HF_TOKEN" in os.environ:
+            del os.environ["HF_TOKEN"]
+
     def sync_runtime_settings(self) -> None:
         settings = self._settings()
+        self._apply_env_vars(settings)
         normalized_model_name = self.normalize_model_name(settings.active_model)
         desired_precision, desired_dtype = self._resolve_model_precision(settings.model_precision)
         model_to_dispose: Any | None = None
@@ -1438,43 +1476,63 @@ class TadaRuntimeService:
             raise FileNotFoundError(f"Generated audio '{file_name}' was not found.")
         return path
 
-    def model_statuses(self) -> list[dict[str, Any]]:
+    def model_statuses(self, storage_path: str | None = None) -> list[dict[str, Any]]:
         settings = self._settings()
-        storage_root = Path(settings.model_storage_path).expanduser()
+        storage_root = _resolve_storage_root(self.project_root, storage_path or settings.model_storage_path)
+        storage_key = os.path.normcase(str(storage_root))
         with self._download_lock:
             jobs = dict(self._download_jobs)
 
         statuses: list[dict[str, Any]] = []
         for model_id, metadata in MODEL_DOWNLOAD_TARGETS.items():
+            repo_root = resolve_cached_repo_root(model_id, self.project_root, extra_roots=[storage_root])
             snapshot = resolve_cached_snapshot(model_id, self.project_root, extra_roots=[storage_root])
-            job = jobs.get(model_id)
+            job = jobs.get((model_id, storage_key))
+
+            if job and job.get("status") == "downloading":
+                status = "downloading"
+            elif snapshot:
+                status = "ready"
+            elif job and job.get("status") == "error":
+                status = "error"
+            elif repo_root:
+                status = "partial"
+            else:
+                status = "missing"
+
+            size_source = snapshot or repo_root
             statuses.append(
                 {
                     "id": model_id,
                     "label": metadata["label"],
                     "kind": metadata["kind"],
-                    "status": job["status"] if job else ("ready" if snapshot else "missing"),
+                    "status": status,
                     "local_path": str(snapshot) if snapshot else None,
-                    "error": job.get("error") if job else None,
+                    "cache_path": str(repo_root) if repo_root else None,
+                    "error": job.get("error") if job and job.get("status") == "error" else None,
                     "updated_at": job.get("updated_at") if job else None,
                     "storage_root": str(storage_root),
+                    "approx_size_gb": metadata.get("approx_size_gb"),
+                    "size_on_disk_gb": _directory_size_gb(size_source),
                 }
             )
         return statuses
 
-    def queue_model_download(self, model_id: str) -> dict[str, Any]:
+    def queue_model_download(self, model_id: str, storage_path: str | None = None) -> dict[str, Any]:
         if model_id not in MODEL_DOWNLOAD_TARGETS:
             raise ValueError(f"Unsupported model id '{model_id}'.")
 
         settings = self._settings()
-        storage_root = Path(settings.model_storage_path).expanduser()
+        storage_root = _resolve_storage_root(self.project_root, storage_path or settings.model_storage_path)
+        storage_key = os.path.normcase(str(storage_root))
         storage_root.mkdir(parents=True, exist_ok=True)
         with self._download_lock:
-            existing = self._download_jobs.get(model_id)
+            existing = self._download_jobs.get((model_id, storage_key))
             if existing and existing["status"] == "downloading":
                 return dict(existing)
-            self._download_jobs[model_id] = {
+            self._download_jobs[(model_id, storage_key)] = {
                 "model_id": model_id,
+                "storage_root": str(storage_root),
                 "status": "downloading",
                 "error": None,
                 "updated_at": now_iso(),
@@ -1485,8 +1543,9 @@ class TadaRuntimeService:
                 snapshot_download(model_id, cache_dir=str(storage_root), resume_download=True, **self._hf_kwargs())
             except Exception as exc:
                 with self._download_lock:
-                    self._download_jobs[model_id] = {
+                    self._download_jobs[(model_id, storage_key)] = {
                         "model_id": model_id,
+                        "storage_root": str(storage_root),
                         "status": "error",
                         "error": str(exc),
                         "updated_at": now_iso(),
@@ -1494,8 +1553,9 @@ class TadaRuntimeService:
                 return
 
             with self._download_lock:
-                self._download_jobs[model_id] = {
+                self._download_jobs[(model_id, storage_key)] = {
                     "model_id": model_id,
+                    "storage_root": str(storage_root),
                     "status": "ready",
                     "error": None,
                     "updated_at": now_iso(),
@@ -1503,7 +1563,37 @@ class TadaRuntimeService:
 
         threading.Thread(target=worker, daemon=True).start()
         with self._download_lock:
-            return dict(self._download_jobs[model_id])
+            return dict(self._download_jobs[(model_id, storage_key)])
+
+    def delete_model_cache(self, model_id: str, storage_path: str | None = None) -> dict[str, Any]:
+        if model_id not in MODEL_DOWNLOAD_TARGETS:
+            raise ValueError(f"Unsupported model id '{model_id}'.")
+
+        settings = self._settings()
+        storage_root = _resolve_storage_root(self.project_root, storage_path or settings.model_storage_path)
+        storage_key = os.path.normcase(str(storage_root))
+        with self._download_lock:
+            existing = self._download_jobs.get((model_id, storage_key))
+            if existing and existing["status"] == "downloading":
+                raise ValueError(f"Model '{model_id}' is still downloading.")
+
+        repo_root = resolve_cached_repo_root(model_id, self.project_root, extra_roots=[storage_root])
+        removed = False
+        removed_path = None
+        if repo_root and repo_root.exists():
+            shutil.rmtree(repo_root)
+            removed = True
+            removed_path = str(repo_root)
+
+        with self._download_lock:
+            self._download_jobs.pop((model_id, storage_key), None)
+
+        return {
+            "ok": True,
+            "removed": removed,
+            "removed_path": removed_path,
+            "storage_root": str(storage_root),
+        }
 
     @staticmethod
     def _output_sample_rate(model: Any) -> int:

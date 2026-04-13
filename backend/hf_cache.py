@@ -30,6 +30,10 @@ def candidate_hf_cache_roots(project_root: Path, extra_roots: list[Path] | None 
     if hf_home:
         add(_absolute_from_project(hf_home, project_root) / "hub")
 
+    tada_storage = os.getenv("TADA_MODEL_STORAGE_PATH")
+    if tada_storage:
+        add(_absolute_from_project(tada_storage, project_root))
+
     add((project_root / ".hf_cache" / "hub").resolve(strict=False))
     add((project_root / "backend" / "cache" / "huggingface" / "hub").resolve(strict=False))
     for extra_root in extra_roots or []:
@@ -61,6 +65,19 @@ def resolve_cached_snapshot(repo_id: str, project_root: Path, extra_roots: list[
             snapshots = [path for path in snapshots_dir.iterdir() if path.is_dir()]
             if snapshots:
                 return max(snapshots, key=lambda path: path.stat().st_mtime)
+
+    return None
+
+
+def resolve_cached_repo_root(repo_id: str, project_root: Path, extra_roots: list[Path] | None = None) -> Path | None:
+    if "/" not in repo_id:
+        return None
+
+    repo_dir_name = f"models--{repo_id.replace('/', '--')}"
+    for cache_root in candidate_hf_cache_roots(project_root, extra_roots=extra_roots):
+        repo_root = cache_root / repo_dir_name
+        if repo_root.exists():
+            return repo_root
 
     return None
 

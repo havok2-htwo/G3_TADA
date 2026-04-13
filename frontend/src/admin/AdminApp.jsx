@@ -65,6 +65,38 @@ function formatReferenceLimit(value) {
   return Number.isInteger(Number(value)) ? Number(value).toFixed(0) : Number(value).toFixed(1);
 }
 
+function formatModelSize(model) {
+  if (Number.isFinite(Number(model?.size_on_disk_gb))) {
+    const value = Number(model.size_on_disk_gb);
+    return `${value.toFixed(value >= 10 ? 1 : 2)} GB`;
+  }
+  if (Number.isFinite(Number(model?.approx_size_gb))) {
+    const value = Number(model.approx_size_gb);
+    return `~${value.toFixed(value >= 10 ? 1 : 2)} GB`;
+  }
+  return "-";
+}
+
+function formatModelStatus(status) {
+  if (status === "ready") {
+    return "Ready";
+  }
+  if (status === "downloading") {
+    return "Downloading";
+  }
+  if (status === "partial") {
+    return "Partial";
+  }
+  if (status === "error") {
+    return "Error";
+  }
+  return "Missing";
+}
+
+function resolveModelPath(model) {
+  return model.local_path || model.cache_path || model.storage_root;
+}
+
 function parseSecondsToMs(value) {
   if (value === null || value === undefined || String(value).trim() === "") {
     return null;
@@ -434,6 +466,7 @@ export default function AdminApp() {
   const [selectedPresetName, setSelectedPresetName] = useState("");
   const [newPresetName, setNewPresetName] = useState("");
   const [voiceAudioUrls, setVoiceAudioUrls] = useState({});
+  const [modelAction, setModelAction] = useState(null);
   const dashboardAbortRef = useRef(null);
   const trimLoopAudioRef = useRef(null);
 
@@ -879,6 +912,7 @@ export default function AdminApp() {
     setSelectedPresetName("");
     setNewPresetName("");
     setDashboard(null);
+    setModelAction(null);
     setVoicePreview(EMPTY_VOICE_PREVIEW);
     if (nextMessage) {
       setError(nextMessage);
@@ -1219,16 +1253,48 @@ export default function AdminApp() {
     }
   }
 
+  async function handleModelRefresh() {
+    setError("");
+    setMessage("");
+    setModelAction({ kind: "refresh", modelId: "__refresh__" });
+    try {
+      const storagePath = draftSettings.model_storage_path || "";
+      const query = `?storage_path=${encodeURIComponent(storagePath)}`;
+      const data = await apiFetch(`/api/admin/models${query}`, {
+        adminKey,
+      });
+      setModelSnapshot(data.models || []);
+      setMessage("Model cache refreshed for the selected path.");
+    } catch (refreshError) {
+      if (isUnauthorizedError(refreshError)) {
+        clearPersistedAdminKey({
+          nextMessage: "Your admin key is no longer valid. Please sign in again.",
+          keepInputValue: adminKey,
+        });
+        return;
+      }
+      setError(refreshError.message);
+    } finally {
+      setModelAction(null);
+    }
+  }
+
   async function handleModelDownload(modelId) {
     setError("");
+    setMessage("");
+    setModelAction({ kind: "download", modelId });
     try {
       const data = await apiFetch("/api/admin/models/download", {
         method: "POST",
         adminKey,
-        body: { model_id: modelId },
+        body: {
+          model_id: modelId,
+          storage_path: draftSettings.model_storage_path || "",
+        },
       });
       setModelSnapshot(data.models || []);
-      setMessage(`Download job queued for ${modelId}.`);
+      const selectedModel = modelSnapshot.find((model) => model.id === modelId);
+      setMessage(`Download job queued for ${selectedModel?.label || modelId}.`);
     } catch (downloadError) {
       if (isUnauthorizedError(downloadError)) {
         clearPersistedAdminKey({
@@ -1238,6 +1304,42 @@ export default function AdminApp() {
         return;
       }
       setError(downloadError.message);
+    } finally {
+      setModelAction(null);
+    }
+  }
+
+  async function handleModelDelete(modelId) {
+    setError("");
+    setMessage("");
+    setModelAction({ kind: "delete", modelId });
+    try {
+      const data = await apiFetch("/api/admin/models/delete", {
+        method: "POST",
+        adminKey,
+        body: {
+          model_id: modelId,
+          storage_path: draftSettings.model_storage_path || "",
+        },
+      });
+      setModelSnapshot(data.models || []);
+      const selectedModel = modelSnapshot.find((model) => model.id === modelId);
+      setMessage(
+        data.removed
+          ? `Cached files removed for ${selectedModel?.label || modelId}.`
+          : `No cached files found for ${selectedModel?.label || modelId} in the selected path.`,
+      );
+    } catch (deleteError) {
+      if (isUnauthorizedError(deleteError)) {
+        clearPersistedAdminKey({
+          nextMessage: "Your admin key is no longer valid. Please sign in again.",
+          keepInputValue: adminKey,
+        });
+        return;
+      }
+      setError(deleteError.message);
+    } finally {
+      setModelAction(null);
     }
   }
 
@@ -1508,16 +1610,62 @@ export default function AdminApp() {
         <section className="panel stack full-span">
           <p className="eyebrow">Models</p>
           <h2>Downloads</h2>
+          <div className="card stack compact">
+            <div className="card-header">
+              <div className="stack compact">
+                <strong>Selected Storage Path</strong>
+                <span className="muted">Actions below use the path currently typed in the settings form.</span>
+              </div>
+              <button type="button" className="secondary" onClick={handleModelRefresh} disabled={modelAction?.kind === "refresh"}>
+                {modelAction?.kind === "refresh" ? "Refreshing..." : "Refresh Models"}
+              </button>
+            </div>
+            <div className="mono path-cell">{draftSettings.model_storage_path || "-"}</div>
+            <div className="muted">Downloaded sizes reflect local cache usage. Other values are rough estimates.</div>
+          </div>
           <div className="table-wrap">
             <table className="table downloads-table">
-              <thead><tr><th>Model</th><th className="status-cell">Status</th><th>Path</th><th className="action-cell">Action</th></tr></thead>
+              <thead><tr><th>Model</th><th className="status-cell">Type</th><th className="status-cell">Size</th><th className="status-cell">Status</th><th>Path</th><th className="action-cell">Actions</th></tr></thead>
               <tbody>
                 {modelSnapshot.map((model) => (
                   <tr key={model.id}>
-                    <td>{model.label}</td>
-                    <td className="status-cell">{model.status}</td>
-                    <td className="mono path-cell">{model.local_path || model.storage_root}</td>
-                    <td className="action-cell"><button type="button" className="secondary" onClick={() => handleModelDownload(model.id)} disabled={model.status === "downloading"}>{model.status === "downloading" ? "Downloading..." : "Download"}</button></td>
+                    <td>
+                      <strong>{model.label}</strong>
+                      <div className="muted mono model-meta">{model.id}</div>
+                    </td>
+                    <td className="status-cell">{model.kind}</td>
+                    <td className="status-cell">{formatModelSize(model)}</td>
+                    <td className="status-cell">
+                      <strong>{formatModelStatus(model.status)}</strong>
+                      {model.error ? <div className="muted model-error">{model.error}</div> : null}
+                    </td>
+                    <td className="mono path-cell">{resolveModelPath(model)}</td>
+                    <td className="action-cell">
+                      <div className="button-row compact table-actions">
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => handleModelDownload(model.id)}
+                          disabled={model.status === "downloading" || modelAction?.modelId === model.id}
+                        >
+                          {model.status === "downloading"
+                            ? "Downloading..."
+                            : modelAction?.kind === "download" && modelAction?.modelId === model.id
+                              ? "Starting..."
+                              : model.status === "ready"
+                                ? "Download Again"
+                                : "Download"}
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost danger"
+                          onClick={() => handleModelDelete(model.id)}
+                          disabled={!model.cache_path || model.status === "downloading" || modelAction?.modelId === model.id}
+                        >
+                          {modelAction?.kind === "delete" && modelAction?.modelId === model.id ? "Deleting..." : "Delete"}
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -1585,6 +1733,12 @@ export default function AdminApp() {
         <section className="panel stack">
           <p className="eyebrow">Voices</p>
           <h2>Create Voice</h2>
+          {runtimeSnapshot && !runtimeSnapshot.hf_token_present && !draftSettings?.hf_token ? (
+            <div className="message warning" style={{ marginBottom: "1rem" }}>
+              <strong>Hugging Face Token Required</strong>
+              <p>Voice cloning requires downloading the gated Meta Llama 3 tokenizer. Please save your HF-Token in the Runtime Config section below before adding voices.</p>
+            </div>
+          ) : null}
           <form className="stack" onSubmit={handleVoiceCreate}>
             <div className="two-col">
               <label>Name<input value={voiceForm.name} onChange={(event) => setVoiceForm((current) => ({ ...current, name: event.target.value }))} /></label>
