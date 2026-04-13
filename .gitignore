@@ -25,6 +25,7 @@ backend/data/server_secrets.json
 
 # Generated audio
 backend/generated/
+backend/data/generated_history.jsonl
 
 # Backend data caches
 backend/cache/
