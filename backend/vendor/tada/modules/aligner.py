@@ -100,6 +100,7 @@ class Aligner(PreTrainedModel):
     def __init__(
         self,
         config: AlignerConfig,
+        **kwargs,
     ):
         """Aligner module for aligning audio to text tokens.
 
@@ -112,9 +113,20 @@ class Aligner(PreTrainedModel):
             inference_window_stride: Stride between windows (default: window_size // 2).
         """
         super().__init__(config)
+        import os
         project_root = Path(__file__).resolve().parents[4]
-        tokenizer_source, tokenizer_is_local = resolve_pretrained_source(config.tokenizer_name, project_root)
-        tokenizer_kwargs = {"local_files_only": True} if tokenizer_is_local else {}
+        
+        extra_roots = []
+        hf_hub_cache = os.getenv("HF_HUB_CACHE")
+        if hf_hub_cache:
+            extra_roots.append(Path(hf_hub_cache))
+            
+        tokenizer_source, tokenizer_is_local = resolve_pretrained_source(config.tokenizer_name, project_root, extra_roots=extra_roots)
+        
+        tokenizer_kwargs = dict(kwargs)
+        if tokenizer_is_local:
+            tokenizer_kwargs["local_files_only"] = True
+            
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, **tokenizer_kwargs)
 
         encoder_source, encoder_is_local = resolve_pretrained_source(config.base_model_name, project_root)

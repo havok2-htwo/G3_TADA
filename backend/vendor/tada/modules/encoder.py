@@ -682,7 +682,7 @@ class Encoder(PreTrainedModel):
     def from_pretrained(cls, pretrained_model_name_or_path: str, subfolder: str = "encoder", language: str | None = None, **kwargs):
         self = super().from_pretrained(pretrained_model_name_or_path, subfolder=subfolder, **kwargs)
         aligner_subfolder = f"aligner-{language}" if language else "aligner"
-        self._aligner = Aligner.from_pretrained(pretrained_model_name_or_path, subfolder=aligner_subfolder)
+        self._aligner = Aligner.from_pretrained(pretrained_model_name_or_path, subfolder=aligner_subfolder, **kwargs)
         return self
 
     def to(self, device: str):

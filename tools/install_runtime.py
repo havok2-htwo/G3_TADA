@@ -427,17 +427,12 @@ def install_base_runtime(*, offline: bool, force: bool = False) -> None:
 
 def install_vendor_packages(*, offline: bool) -> None:
     vendor_entry = VENDOR_DIR / "tada" / "modules" / "tada.py"
-    if vendor_entry.exists() and os.getenv("TADA_FORCE_VENDOR_REINSTALL", "0") not in {"1", "true", "yes"}:
-        log("Repo vendor is already present. Keeping local patches and skipping vendor reinstall.")
-        return
-
-    VENDOR_DIR.mkdir(parents=True, exist_ok=True)
+    if not vendor_entry.exists():
+        log("Warning: backend/vendor/tada is missing from the repository. This should be tracked by git.")
+        
+    log("Installing hume-tada dependencies into the active environment...")
     pip_install(
-        ["--target", str(VENDOR_DIR), "--no-deps", "hume-tada", "descript-audio-codec"],
-        offline=offline,
-    )
-    pip_install(
-        ["--target", str(VENDOR_DIR), "argbind", "descript-audiotools"],
+        ["descript-audio-codec", "argbind", "descript-audiotools"], 
         offline=offline,
     )
 
