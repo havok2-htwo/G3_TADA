@@ -60,6 +60,7 @@ class AdminSettingsUpdateRequest(BaseModel):
 
 class ModelDownloadRequest(BaseModel):
     model_id: str
+    storage_path: Optional[str] = None
 
 
 class SettingsPresetRequest(BaseModel):
@@ -316,8 +317,8 @@ def admin_apply_settings_preset(
 
 
 @app.get("/api/admin/models")
-def admin_models(_: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]:
-    return {"models": runtime_service.model_statuses()}
+def admin_models(storage_path: Optional[str] = None, _: dict[str, str] = Depends(require_admin_key)) -> dict[str, Any]:
+    return {"models": runtime_service.model_statuses(storage_path=storage_path)}
 
 
 @app.post("/api/admin/models/download")
@@ -326,10 +327,22 @@ def admin_model_download(
     _: dict[str, str] = Depends(require_admin_key),
 ) -> dict[str, Any]:
     try:
-        job = runtime_service.queue_model_download(request.model_id)
+        job = runtime_service.queue_model_download(request.model_id, storage_path=request.storage_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"job": job, "models": runtime_service.model_statuses()}
+    return {"job": job, "models": runtime_service.model_statuses(storage_path=request.storage_path)}
+
+
+@app.post("/api/admin/models/delete")
+def admin_model_delete(
+    request: ModelDownloadRequest,
+    _: dict[str, str] = Depends(require_admin_key),
+) -> dict[str, Any]:
+    try:
+        result = runtime_service.delete_model_cache(request.model_id, storage_path=request.storage_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**result, "models": runtime_service.model_statuses(storage_path=request.storage_path)}
 
 
 @app.get("/api/admin/voices")

@@ -10,6 +10,7 @@ const REFERENCE_TAIL_SILENCE_SECONDS = 0.5;
 const GRAPH_HISTORY_SECONDS = 60;
 const GRAPH_REFRESH_SECONDS = 0.5;
 const GRAPH_HISTORY_POINTS = Math.round(GRAPH_HISTORY_SECONDS / GRAPH_REFRESH_SECONDS);
+const MODEL_STATUS_POLL_MS = 2000;
 const FALLBACK_AVAILABLE_MODELS = [
   {
     id: "HumeAI/tada-3b-ml",
@@ -469,6 +470,7 @@ export default function AdminApp() {
   const [modelAction, setModelAction] = useState(null);
   const dashboardAbortRef = useRef(null);
   const trimLoopAudioRef = useRef(null);
+  const hasDownloadingModels = modelSnapshot.some((model) => model.status === "downloading");
 
   const selectedTrim = useMemo(
     () => computeTrimSelection(parseSecondsToMs(voiceForm.trimStartSeconds), parseSecondsToMs(voiceForm.trimEndSeconds), voicePreview.durationMs || (MAX_REFERENCE_SECONDS * 1000)),
@@ -891,6 +893,20 @@ export default function AdminApp() {
     });
   }, [adminKey]);
 
+  useEffect(() => {
+    if (!adminKey || !hasDownloadingModels) {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshModelStatuses({ silent: true });
+    }, MODEL_STATUS_POLL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [adminKey, hasDownloadingModels, modelSnapshot, draftSettings.model_storage_path]);
+
   function persistAdminKey(nextKey) {
     writeStoredAdminKey(nextKey);
     setAdminKey(nextKey);
@@ -1253,18 +1269,17 @@ export default function AdminApp() {
     }
   }
 
-  async function handleModelRefresh() {
-    setError("");
-    setMessage("");
-    setModelAction({ kind: "refresh", modelId: "__refresh__" });
+  async function refreshModelStatuses({ silent = false, storagePath } = {}) {
+    if (!adminKey) {
+      return;
+    }
     try {
-      const storagePath = draftSettings.model_storage_path || "";
-      const query = `?storage_path=${encodeURIComponent(storagePath)}`;
+      const effectiveStoragePath = storagePath ?? modelSnapshot[0]?.storage_root ?? draftSettings.model_storage_path ?? "";
+      const query = `?storage_path=${encodeURIComponent(effectiveStoragePath)}`;
       const data = await apiFetch(`/api/admin/models${query}`, {
         adminKey,
       });
       setModelSnapshot(data.models || []);
-      setMessage("Model cache refreshed for the selected path.");
     } catch (refreshError) {
       if (isUnauthorizedError(refreshError)) {
         clearPersistedAdminKey({
@@ -1273,7 +1288,21 @@ export default function AdminApp() {
         });
         return;
       }
-      setError(refreshError.message);
+      if (!silent) {
+        setError(refreshError.message);
+      }
+    }
+  }
+
+  async function handleModelRefresh() {
+    setError("");
+    setMessage("");
+    setModelAction({ kind: "refresh", modelId: "__refresh__" });
+    try {
+      await refreshModelStatuses({
+        storagePath: draftSettings.model_storage_path || "",
+      });
+      setMessage("Model cache refreshed for the selected path.");
     } finally {
       setModelAction(null);
     }

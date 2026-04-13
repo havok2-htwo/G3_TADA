@@ -323,7 +323,7 @@ textarea {
 
 .action-cell {
   width: 1%;
-  min-width: 128px;
+  min-width: 208px;
   white-space: nowrap;
 }
 
@@ -342,6 +342,21 @@ textarea {
 .path-cell {
   min-width: 260px;
   word-break: break-word;
+}
+
+.table-actions {
+  align-items: flex-start;
+}
+
+.model-meta {
+  margin-top: 6px;
+}
+
+.model-error {
+  margin-top: 6px;
+  max-width: 320px;
+  color: var(--danger);
+  white-space: normal;
 }
 
 .list {
