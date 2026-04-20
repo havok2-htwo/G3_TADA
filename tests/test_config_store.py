@@ -22,6 +22,7 @@ class ConfigStoreTests(unittest.TestCase):
                 self.assertIsNone(snapshot["deterministic_seed"])
                 self.assertFalse(snapshot["persist_generated_wavs"])
                 self.assertEqual(snapshot["prompt_start_trim_steps"], 0)
+                self.assertEqual(snapshot["stream_prebuffer_ms"], 250)
 
                 updated = store.update_settings(
                     {
@@ -34,6 +35,7 @@ class ConfigStoreTests(unittest.TestCase):
                         "short_sentence_merge_max_chars": 999,
                         "following_sentence_merge_min_chars": -5,
                         "allow_lan_access": True,
+                        "stream_prebuffer_ms": 9999,
                     }
                 )
                 self.assertEqual(updated["max_batch_size"], 4)
@@ -45,6 +47,7 @@ class ConfigStoreTests(unittest.TestCase):
                 self.assertEqual(updated["short_sentence_merge_max_chars"], 200)
                 self.assertEqual(updated["following_sentence_merge_min_chars"], 0)
                 self.assertTrue(updated["allow_lan_access"])
+                self.assertEqual(updated["stream_prebuffer_ms"], 5000)
                 self.assertTrue(updated["restart_required"])
                 self.assertTrue(store.verify_admin_key("admin-test-key"))
             finally:

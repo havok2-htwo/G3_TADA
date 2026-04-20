@@ -1,6 +1,6 @@
 {
   "preset_name": "Initial 3B",
-  "saved_at": "2026-04-13T09:31:10.613965+00:00",
+  "saved_at": "2026-04-13T12:55:30.654120+00:00",
   "settings": {
     "active_model": "HumeAI/tada-3b-ml",
     "model_precision": "fp16",
@@ -12,6 +12,7 @@
     "following_sentence_merge_min_chars": 20,
     "allow_lan_access": true,
     "stream_start_buffer_ms": 800,
+    "stream_prebuffer_ms": 250,
     "stream_chunk_ms": 300,
     "batch_wait_ms": 50,
     "max_batch_size": 64,

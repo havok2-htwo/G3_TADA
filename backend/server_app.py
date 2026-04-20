@@ -40,6 +40,7 @@ class AdminSettingsUpdateRequest(BaseModel):
     following_sentence_merge_min_chars: Optional[int] = Field(default=None, ge=0, le=500)
     allow_lan_access: Optional[bool] = None
     stream_start_buffer_ms: Optional[int] = Field(default=None, ge=0, le=5000)
+    stream_prebuffer_ms: Optional[int] = Field(default=None, ge=0, le=5000)
     stream_chunk_ms: Optional[int] = Field(default=None, ge=50, le=5000)
     batch_wait_ms: Optional[int] = Field(default=None, ge=0, le=5000)
     max_batch_size: Optional[int] = Field(default=None, ge=1, le=128)

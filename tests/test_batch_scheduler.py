@@ -82,6 +82,49 @@ class FakeProgressiveRuntimeService(FakeRuntimeService):
         return results
 
 
+class FakePrebufferedPreviewRuntimeService(FakeRuntimeService):
+    def generate_batch_progressive(self, items, *, on_preview=None):
+        self.calls.append([(item.request_id, item.sentence_index, item.text) for item in items])
+        results = []
+        for item in items:
+            if on_preview is not None:
+                on_preview(
+                    BatchPreviewUpdate(
+                        request_id=item.request_id,
+                        voice_id=item.voice_id,
+                        text=item.text,
+                        sentence_index=item.sentence_index,
+                        waveform_delta=torch.ones(2400, dtype=torch.float32) * 0.1,
+                        sample_rate=24000,
+                        progress_step=1,
+                    )
+                )
+                on_preview(
+                    BatchPreviewUpdate(
+                        request_id=item.request_id,
+                        voice_id=item.voice_id,
+                        text=item.text,
+                        sentence_index=item.sentence_index,
+                        waveform_delta=torch.ones(3600, dtype=torch.float32) * 0.1,
+                        sample_rate=24000,
+                        progress_step=2,
+                    )
+                )
+            samples = torch.ones(1, 24000, dtype=torch.float32) * 0.1
+            results.append(
+                BatchGenerationResult(
+                    request_id=item.request_id,
+                    voice_id=item.voice_id,
+                    text=item.text,
+                    sentence_index=item.sentence_index,
+                    waveform=samples,
+                    sample_rate=24000,
+                    duration_seconds=1.0,
+                )
+            )
+        return results
+
+
 class BatchSchedulerTests(unittest.TestCase):
     def test_voice_only_batching_keeps_mixed_queue_isolated(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -260,6 +303,48 @@ class BatchSchedulerTests(unittest.TestCase):
                     pcm_bytes = base64.b64decode(event["pcm16_b64"])
                     total_samples += len(pcm_bytes) // 2
                 self.assertEqual(total_samples, 48000)
+            finally:
+                if previous is None:
+                    os.environ.pop("TADA_ADMIN_KEY", None)
+                else:
+                    os.environ["TADA_ADMIN_KEY"] = previous
+            time.sleep(0.1)
+
+    def test_preview_prebuffer_collects_audio_before_first_chunk(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous = os.environ.get("TADA_ADMIN_KEY")
+            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
+            try:
+                store = ConfigStore(Path(temp_dir))
+                store.update_settings(
+                    {
+                        "max_batch_size": 1,
+                        "max_parallel_requests": 1,
+                        "batch_wait_ms": 0,
+                        "stream_chunk_ms": 500,
+                        "stream_start_buffer_ms": 500,
+                        "stream_prebuffer_ms": 250,
+                    }
+                )
+                runtime = FakePrebufferedPreviewRuntimeService()
+                scheduler = BatchScheduler(runtime, store)
+
+                state = scheduler.submit_request(text="A1.", voice_id="voice-a")
+                events = list(scheduler.iter_request_events(state))
+                chunk_events = [event for event in events if event["type"] == "chunk"]
+
+                self.assertGreaterEqual(len(chunk_events), 2)
+                self.assertTrue(chunk_events[0]["preview"])
+                self.assertEqual(chunk_events[0]["progress_step"], 2)
+
+                first_preview_samples = len(base64.b64decode(chunk_events[0]["pcm16_b64"])) // 2
+                self.assertEqual(first_preview_samples, 6000)
+
+                total_samples = 0
+                for event in chunk_events:
+                    pcm_bytes = base64.b64decode(event["pcm16_b64"])
+                    total_samples += len(pcm_bytes) // 2
+                self.assertEqual(total_samples, 24000)
             finally:
                 if previous is None:
                     os.environ.pop("TADA_ADMIN_KEY", None)

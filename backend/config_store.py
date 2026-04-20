@@ -104,6 +104,7 @@ class ServerSettings:
     following_sentence_merge_min_chars: int
     allow_lan_access: bool
     stream_start_buffer_ms: int
+    stream_prebuffer_ms: int
     stream_chunk_ms: int
     batch_wait_ms: int
     max_batch_size: int
@@ -152,6 +153,12 @@ class ServerSettings:
                 minimum=0,
                 maximum=5000,
                 default=500,
+            ),
+            stream_prebuffer_ms=_clamp_int(
+                payload.get("stream_prebuffer_ms"),
+                minimum=0,
+                maximum=5000,
+                default=250,
             ),
             stream_chunk_ms=_clamp_int(payload.get("stream_chunk_ms"), minimum=50, maximum=5000, default=500),
             batch_wait_ms=_clamp_int(payload.get("batch_wait_ms"), minimum=0, maximum=5000, default=500),
@@ -219,6 +226,7 @@ class ConfigStore:
                         "following_sentence_merge_min_chars": 20,
                         "allow_lan_access": os.getenv("TADA_ALLOW_LAN_ACCESS", "0").lower() in {"1", "true", "yes"},
                         "stream_start_buffer_ms": 500,
+                        "stream_prebuffer_ms": 250,
                         "stream_chunk_ms": 500,
                         "batch_wait_ms": 500,
                         "max_batch_size": 8,

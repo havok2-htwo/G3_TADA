@@ -505,12 +505,13 @@ export default function AdminApp() {
       short_sentence_merge_max_chars: settingsSnapshot?.short_sentence_merge_max_chars ?? 30,
       following_sentence_merge_min_chars: settingsSnapshot?.following_sentence_merge_min_chars ?? 20,
       allow_lan_access: settingsSnapshot?.allow_lan_access ?? false,
-      stream_start_buffer_ms: settingsSnapshot?.stream_start_buffer_ms || 500,
-      stream_chunk_ms: settingsSnapshot?.stream_chunk_ms || 500,
-      batch_wait_ms: settingsSnapshot?.batch_wait_ms || 500,
-      max_batch_size: settingsSnapshot?.max_batch_size || 8,
-      max_parallel_requests: settingsSnapshot?.max_parallel_requests || 8,
-      max_queue_size: settingsSnapshot?.max_queue_size || 256,
+      stream_start_buffer_ms: settingsSnapshot?.stream_start_buffer_ms ?? 500,
+      stream_prebuffer_ms: settingsSnapshot?.stream_prebuffer_ms ?? 250,
+      stream_chunk_ms: settingsSnapshot?.stream_chunk_ms ?? 500,
+      batch_wait_ms: settingsSnapshot?.batch_wait_ms ?? 500,
+      max_batch_size: settingsSnapshot?.max_batch_size ?? 8,
+      max_parallel_requests: settingsSnapshot?.max_parallel_requests ?? 8,
+      max_queue_size: settingsSnapshot?.max_queue_size ?? 256,
       model_storage_path: settingsSnapshot?.model_storage_path || "",
       whisper_base_url: settingsSnapshot?.whisper_base_url || "",
       vad_trimming: settingsSnapshot?.vad_trimming ?? true,
@@ -1601,7 +1602,8 @@ export default function AdminApp() {
               <label>Steps<InfoTip text="Number of ODE solver steps for the Flow Matching diffusion model. More steps = higher quality but slower. 8–16 is a good range; default is 10." /><input type="number" min="1" max="128" value={draftSettings.steps} onChange={(event) => setDraftSettings((current) => ({ ...current, steps: Number(event.target.value) }))} /></label>
               <label>Batch Wait (ms)<InfoTip text="How long the scheduler waits for additional requests before dispatching a batch. Higher values fill batches better but add latency. 0 = dispatch immediately." /><input type="number" min="0" max="5000" value={draftSettings.batch_wait_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, batch_wait_ms: Number(event.target.value) }))} /></label>
               <label>Chunk Size (ms)<InfoTip text="Duration of each audio chunk sent to the client during streaming. Smaller chunks = lower latency, larger chunks = fewer network round-trips. Default: 500 ms." /><input type="number" min="50" max="5000" value={draftSettings.stream_chunk_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_chunk_ms: Number(event.target.value) }))} /></label>
-              <label>Start Buffer (ms)<InfoTip text="Audio buffered before the stream begins playback. Prevents stuttering at the cost of initial delay. Default: 500 ms." /><input type="number" min="0" max="5000" value={draftSettings.stream_start_buffer_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_start_buffer_ms: Number(event.target.value) }))} /></label>
+              <label>Preview Tail Buffer (ms)<InfoTip text="Generated audio held back on the server so only a stable prefix is streamed during progressive preview. Higher values reduce unstable tail artifacts but increase initial delay. Default: 500 ms." /><input type="number" min="0" max="5000" value={draftSettings.stream_start_buffer_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_start_buffer_ms: Number(event.target.value) }))} /></label>
+              <label>Start Prebuffer (ms)<InfoTip text="Ready audio collected before the first preview chunk of a sentence is emitted. Helps prevent a short stutter when the second chunk arrives late. Default: 250 ms." /><input type="number" min="0" max="5000" value={draftSettings.stream_prebuffer_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, stream_prebuffer_ms: Number(event.target.value) }))} /></label>
               <label>Max Batch Size<InfoTip text="Maximum number of sentences processed in a single GPU batch. Higher = better throughput but more VRAM. All items in a batch must share the same voice." /><input type="number" min="1" max="128" value={draftSettings.max_batch_size} onChange={(event) => setDraftSettings((current) => ({ ...current, max_batch_size: Number(event.target.value) }))} /></label>
               <label>Max Parallel Requests<InfoTip text="Maximum number of synthesis requests processed concurrently. Each request may produce multiple sentences that enter the batch queue. Capped by Max Batch Size." /><input type="number" min="1" max="128" value={draftSettings.max_parallel_requests} onChange={(event) => setDraftSettings((current) => ({ ...current, max_parallel_requests: Number(event.target.value) }))} /></label>
               <label>Queue Limit<InfoTip text="Maximum number of requests waiting in the queue. New requests are rejected with a 503 error when the queue is full." /><input type="number" min="1" max="2048" value={draftSettings.max_queue_size} onChange={(event) => setDraftSettings((current) => ({ ...current, max_queue_size: Number(event.target.value) }))} /></label>

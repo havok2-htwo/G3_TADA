@@ -40,6 +40,7 @@ class SynthesisRequestState:
     emitted_total_samples: int = 0
     emitted_samples_by_sentence: dict[int, int] = field(default_factory=dict)
     chunk_index_by_sentence: dict[int, int] = field(default_factory=dict)
+    pending_preview_by_sentence: dict[int, torch.Tensor] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
 
@@ -356,7 +357,7 @@ class BatchScheduler:
                     state = state_by_request.get(update.request_id)
                     if state is None or state.error or state.next_emit_sentence_index != update.sentence_index:
                         return
-                    self._emit_audio_chunks_locked(
+                    self._emit_preview_audio_locked(
                         state,
                         waveform=update.waveform_delta,
                         sample_rate=update.sample_rate,
@@ -419,6 +420,7 @@ class BatchScheduler:
         while state.next_emit_sentence_index in state.sentence_waveforms:
             sentence_index = state.next_emit_sentence_index
             final_mono = state.sentence_waveforms[sentence_index].detach().float().cpu().reshape(-1)
+            state.pending_preview_by_sentence.pop(sentence_index, None)
             emitted_samples = state.emitted_samples_by_sentence.get(sentence_index, 0)
             remaining = final_mono[emitted_samples:]
             self._emit_audio_chunks_locked(
@@ -433,6 +435,53 @@ class BatchScheduler:
             state.emitted_samples_by_sentence.pop(sentence_index, None)
             state.chunk_index_by_sentence.pop(sentence_index, None)
             state.next_emit_sentence_index += 1
+
+    def _emit_preview_audio_locked(
+        self,
+        state: SynthesisRequestState,
+        *,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        sentence_index: int,
+        progress_step: int,
+        preview: bool,
+        final_chunk_of_sentence: bool,
+    ) -> None:
+        if int(waveform.numel()) == 0:
+            return
+        settings = self.config_store.get_settings()
+        prebuffer_ms = max(0, int(settings.stream_prebuffer_ms))
+        if prebuffer_ms <= 0 or state.emitted_samples_by_sentence.get(sentence_index, 0) > 0:
+            self._emit_audio_chunks_locked(
+                state,
+                waveform=waveform,
+                sample_rate=sample_rate,
+                sentence_index=sentence_index,
+                progress_step=progress_step,
+                preview=preview,
+                final_chunk_of_sentence=final_chunk_of_sentence,
+            )
+            return
+
+        buffered = waveform.detach().float().cpu().reshape(-1)
+        pending = state.pending_preview_by_sentence.get(sentence_index)
+        if pending is not None and int(pending.numel()) > 0:
+            buffered = torch.cat([pending, buffered], dim=-1)
+        buffered_ms = float(buffered.numel()) / float(sample_rate) * 1000.0
+        if buffered_ms < float(prebuffer_ms):
+            state.pending_preview_by_sentence[sentence_index] = buffered
+            return
+
+        state.pending_preview_by_sentence.pop(sentence_index, None)
+        self._emit_audio_chunks_locked(
+            state,
+            waveform=buffered,
+            sample_rate=sample_rate,
+            sentence_index=sentence_index,
+            progress_step=progress_step,
+            preview=preview,
+            final_chunk_of_sentence=final_chunk_of_sentence,
+        )
 
     def _emit_audio_chunks_locked(
         self,
