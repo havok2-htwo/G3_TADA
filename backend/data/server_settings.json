@@ -10,7 +10,7 @@
   "allow_lan_access": true,
   "stream_start_buffer_ms": 800,
   "stream_prebuffer_ms": 250,
-  "stream_chunk_ms": 300,
+  "stream_chunk_ms": 400,
   "batch_wait_ms": 50,
   "max_batch_size": 16,
   "max_parallel_requests": 16,

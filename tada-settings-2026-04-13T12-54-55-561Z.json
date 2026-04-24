@@ -1,0 +1,30 @@
+{
+  "exported_at": "2026-04-13T12:54:55.562Z",
+  "settings": {
+    "active_model": "HumeAI/tada-3b-ml",
+    "model_precision": "fp16",
+    "deterministic_seed": 88205,
+    "persist_generated_wavs": false,
+    "steps": 4,
+    "sentence_chunking": true,
+    "short_sentence_merge_max_chars": 30,
+    "following_sentence_merge_min_chars": 20,
+    "allow_lan_access": true,
+    "stream_start_buffer_ms": 800,
+    "stream_chunk_ms": 300,
+    "batch_wait_ms": 50,
+    "max_batch_size": 64,
+    "max_parallel_requests": 64,
+    "max_queue_size": 256,
+    "model_storage_path": "X:\\dev\\G3_TADA3B\\.hf_cache\\hub",
+    "whisper_base_url": "http://localhost:7861/v1",
+    "vad_trimming": true,
+    "prompt_start_trim_steps": 1,
+    "vad_threshold_pct": 0.01,
+    "vad_padding_ms": 75,
+    "vad_fade_ms": 75,
+    "hf_token_present": true,
+    "whisper_api_key_present": false,
+    "restart_required": false
+  }
+}
