@@ -11,6 +11,13 @@ const GRAPH_HISTORY_SECONDS = 60;
 const GRAPH_REFRESH_SECONDS = 0.5;
 const GRAPH_HISTORY_POINTS = Math.round(GRAPH_HISTORY_SECONDS / GRAPH_REFRESH_SECONDS);
 const MODEL_STATUS_POLL_MS = 2000;
+const MODEL_PRECISION_OPTIONS = [
+  { value: "fp16", label: "FP16" },
+  { value: "bf16", label: "BF16" },
+  { value: "bnb8", label: "BNB 8-bit" },
+  { value: "fp8", label: "FP8" },
+  { value: "fp32", label: "FP32" },
+];
 const FALLBACK_AVAILABLE_MODELS = [
   {
     id: "HumeAI/tada-3b-ml",
@@ -1597,7 +1604,7 @@ export default function AdminApp() {
           <form className="stack" onSubmit={handleSettingsSubmit}>
             <div className="two-col">
               <label>Model<InfoTip text="The HuggingFace model ID to use for synthesis. Larger models produce higher quality but are slower and use more VRAM." /><select value={draftSettings.active_model} onChange={(event) => setDraftSettings((current) => ({ ...current, active_model: event.target.value }))}>{availableModelOptions.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></label>
-              <label>Precision<InfoTip text="Floating-point precision for inference. FP16 is recommended for speed and quality. BF16 may reduce artifacts on Ampere+ GPUs. FP32 is slowest but most precise." /><select value={draftSettings.model_precision} onChange={(event) => setDraftSettings((current) => ({ ...current, model_precision: event.target.value }))}><option value="fp16">FP16</option><option value="bf16">BF16</option><option value="fp32">FP32</option></select></label>
+              <label>Precision<InfoTip text="Model load precision/quantization for inference. FP16 is the default fast path. BF16 may reduce artifacts on Ampere+ GPUs. BNB 8-bit reduces VRAM with bitsandbytes. FP8 is experimental and needs a Hopper/Blackwell-class GPU. Quantized modes stream only the final stable audio chunks." /><select value={draftSettings.model_precision} onChange={(event) => setDraftSettings((current) => ({ ...current, model_precision: event.target.value }))}>{MODEL_PRECISION_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
               <label>Deterministic Seed<InfoTip text="When set, every request uses this fixed seed for the ODE solver, making identical inputs produce identical audio. Leave empty for random variation per request." /><input type="number" min="0" value={draftSettings.deterministic_seed} placeholder="disabled" onChange={(event) => setDraftSettings((current) => ({ ...current, deterministic_seed: event.target.value }))} /></label>
               <label>Steps<InfoTip text="Number of ODE solver steps for the Flow Matching diffusion model. More steps = higher quality but slower. 8–16 is a good range; default is 10." /><input type="number" min="1" max="128" value={draftSettings.steps} onChange={(event) => setDraftSettings((current) => ({ ...current, steps: Number(event.target.value) }))} /></label>
               <label>Batch Wait (ms)<InfoTip text="How long the scheduler waits for additional requests before dispatching a batch. Higher values fill batches better but add latency. 0 = dispatch immediately." /><input type="number" min="0" max="5000" value={draftSettings.batch_wait_ms} onChange={(event) => setDraftSettings((current) => ({ ...current, batch_wait_ms: Number(event.target.value) }))} /></label>

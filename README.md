@@ -177,6 +177,7 @@ Notes:
 
 - `max_parallel_requests` is clamped to `max_batch_size`
 - changing `model_storage_path` or `allow_lan_access` is treated as restart-required
+- `model_precision` supports `fp16`, `bf16`, `fp32`, `bnb8`, and `fp8`; `bnb8` uses bitsandbytes 8-bit quantization, while `fp8` uses Transformers fine-grained FP8 and requires a CUDA GPU with compute capability >= 9; TADA's audio/diffusion head stays unquantized for compatibility, and quantized modes stream only final stable audio chunks
 - `deterministic_seed` is expanded into stable per-sentence seeds based on model, voice and normalized text, so repeated requests can be made reproducible without forcing every sentence to reuse the exact same raw seed
 - `persist_generated_wavs=false` keeps recent generated WAVs only in memory for the current server process; generation metadata stays in history either way
 - `HF_TOKEN` and other environment values are used to seed first-run defaults, but the persisted config is the supported runtime source afterwards

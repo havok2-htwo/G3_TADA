@@ -40,6 +40,7 @@ REQUIRED_MODULES = (
     "einops",
     "transformers",
     "accelerate",
+    "bitsandbytes",
     "fastapi",
     "uvicorn",
     "pydantic",

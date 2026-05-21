@@ -5,6 +5,7 @@ torchaudio
 einops
 transformers>=4.57.1,<5
 accelerate>=1.7,<2
+bitsandbytes>=0.46,<1
 numpy
 soundfile
 huggingface_hub

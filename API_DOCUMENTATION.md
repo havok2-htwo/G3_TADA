@@ -154,7 +154,11 @@ Request body:
 
 Important notes:
 
-- `model_precision` accepts `fp16`, `bf16`, or `fp32`
+- `model_precision` accepts `fp16`, `bf16`, `fp32`, `bnb8`, or `fp8`
+- `bnb8` uses bitsandbytes 8-bit quantization and requires the optional bitsandbytes runtime package
+- `fp8` uses Transformers fine-grained FP8 quantization and requires a CUDA GPU with compute capability >= 9
+- quantized modes keep TADA's audio/diffusion head in regular precision and only quantize compatible Llama-side linear layers
+- quantized modes stream final stable audio chunks only; progressive preview stays enabled for `fp16`, `bf16`, and `fp32`
 - `deterministic_seed` may be `null` or omitted to disable deterministic seeding
 - `persist_generated_wavs=false` keeps recent generated audio in memory instead of writing every WAV to disk
 - `steps` is clamped to `1..128`

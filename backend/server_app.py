@@ -31,7 +31,7 @@ scheduler = BatchScheduler(runtime_service, config_store)
 
 class AdminSettingsUpdateRequest(BaseModel):
     active_model: Optional[str] = None
-    model_precision: Optional[Literal["fp16", "bf16", "fp32"]] = None
+    model_precision: Optional[Literal["fp16", "bf16", "fp32", "bnb8", "fp8"]] = None
     deterministic_seed: Optional[int] = Field(default=None, ge=0, le=2**63 - 1)
     persist_generated_wavs: Optional[bool] = None
     steps: Optional[int] = Field(default=None, ge=1, le=128)

@@ -2,6 +2,7 @@ import os
 import json
 import unittest
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 from urllib import error as urllib_error
@@ -32,6 +33,33 @@ class FakePreviewModel:
         sample_count = encoded.shape[0] * 10
         wav = torch.full((1, 1, sample_count), self.value, dtype=torch.float32)
         return wav
+
+
+class FakeProgressiveModel:
+    def __init__(self):
+        self.progress_callback = None
+
+    def generate(self, *, prompt, text, inference_options, progress_callback=None, progress_interval_steps=None):
+        self.progress_callback = progress_callback
+        return SimpleNamespace(audio=[torch.ones(1, 100, dtype=torch.float32) for _ in text])
+
+
+class FakeProgressiveRuntime(TadaRuntimeService):
+    def __init__(self, project_root: Path, config_store: ConfigStore):
+        super().__init__(project_root, config_store)
+        self.fake_model = FakeProgressiveModel()
+
+    def _load_model(self):
+        return self.fake_model
+
+    def _prepare_batch_items(self, items, settings):
+        return items
+
+    def _prompt_path_for_voice(self, voice_id: str) -> Path:
+        return self.project_root / "prompt.pt"
+
+    def _output_sample_rate(self, model) -> int:
+        return 1000
 
 
 class RuntimePreviewTests(unittest.TestCase):
@@ -130,6 +158,60 @@ class RuntimePreviewTests(unittest.TestCase):
                 side_effect=RuntimeError("device-side assert triggered"),
             ), mock.patch("backend.runtime_service.torch.cuda.ipc_collect"):
                 runtime._dispose_model(object())
+
+    def test_quantization_configs_skip_tada_audio_head_modules(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            config_store = ConfigStore(project_root)
+            runtime = TadaRuntimeService(project_root, config_store)
+            runtime.device = torch.device("cuda")
+
+            config_store.update_settings({"model_precision": "bnb8"})
+            with mock.patch("backend.runtime_service.importlib.util.find_spec", return_value=True):
+                runtime.sync_runtime_settings()
+            bnb_config = runtime._model_quantization_config()
+            self.assertIn("prediction_head", bnb_config.llm_int8_skip_modules)
+            self.assertIn("acoustic_proj", bnb_config.llm_int8_skip_modules)
+
+            config_store.update_settings({"model_precision": "fp8"})
+            with mock.patch("backend.runtime_service.torch.cuda.get_device_capability", return_value=(9, 0)):
+                runtime.sync_runtime_settings()
+            fp8_config = runtime._model_quantization_config()
+            self.assertIn("prediction_head", fp8_config.modules_to_not_convert)
+            self.assertIn("acoustic_proj", fp8_config.modules_to_not_convert)
+
+    def test_quantized_precisions_disable_progressive_preview_callback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            runtime = FakeProgressiveRuntime(project_root, ConfigStore(project_root))
+            runtime.model_precision = "bnb8"
+            items = [BatchGenerationItem(request_id="a", voice_id="voice-a", text="Hallo Welt", sentence_index=0)]
+            preview_updates = []
+
+            with mock.patch("backend.runtime_service.EncoderOutput.load", return_value=SimpleNamespace()), mock.patch(
+                "backend.runtime_service.merge_encoder_outputs",
+                return_value=SimpleNamespace(),
+            ):
+                results = runtime.generate_batch_progressive(items, on_preview=preview_updates.append)
+
+            self.assertIsNone(runtime.fake_model.progress_callback)
+            self.assertEqual(preview_updates, [])
+            self.assertEqual(int(results[0].waveform.numel()), 100)
+
+    def test_standard_precisions_keep_progressive_preview_callback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            runtime = FakeProgressiveRuntime(project_root, ConfigStore(project_root))
+            runtime.model_precision = "fp16"
+            items = [BatchGenerationItem(request_id="a", voice_id="voice-a", text="Hallo Welt", sentence_index=0)]
+
+            with mock.patch("backend.runtime_service.EncoderOutput.load", return_value=SimpleNamespace()), mock.patch(
+                "backend.runtime_service.merge_encoder_outputs",
+                return_value=SimpleNamespace(),
+            ):
+                runtime.generate_batch_progressive(items, on_preview=lambda update: None)
+
+            self.assertIsNotNone(runtime.fake_model.progress_callback)
 
     def test_whisper_request_candidates_cover_openai_and_genesis_shapes(self):
         candidates = TadaRuntimeService._whisper_request_candidates("http://localhost:7861/v1")

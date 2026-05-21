@@ -81,6 +81,24 @@ class ConfigStoreTests(unittest.TestCase):
                 else:
                     os.environ["TADA_ADMIN_KEY"] = previous
 
+    def test_quantized_model_precisions_are_normalized(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous = os.environ.get("TADA_ADMIN_KEY")
+            os.environ["TADA_ADMIN_KEY"] = "admin-test-key"
+            try:
+                store = ConfigStore(Path(temp_dir))
+
+                bnb8 = store.update_settings({"model_precision": "bitsandbytes"})
+                self.assertEqual(bnb8["model_precision"], "bnb8")
+
+                fp8 = store.update_settings({"model_precision": "fp8"})
+                self.assertEqual(fp8["model_precision"], "fp8")
+            finally:
+                if previous is None:
+                    os.environ.pop("TADA_ADMIN_KEY", None)
+                else:
+                    os.environ["TADA_ADMIN_KEY"] = previous
+
     def test_startup_admin_key_is_accepted_until_it_expires(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             previous_admin = os.environ.get("TADA_ADMIN_KEY")

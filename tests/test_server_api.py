@@ -445,7 +445,7 @@ class ServerApiTests(unittest.TestCase):
                         "/api/admin/settings",
                         headers={"X-Admin-Key": admin_token},
                         json={
-                            "model_precision": "fp32",
+                            "model_precision": "bnb8",
                             "deterministic_seed": 4242,
                             "persist_generated_wavs": True,
                             "prompt_start_trim_steps": 3,
@@ -453,7 +453,7 @@ class ServerApiTests(unittest.TestCase):
                     )
                     self.assertEqual(response.status_code, 200)
                     payload = response.json()
-                    self.assertEqual(payload["settings"]["model_precision"], "fp32")
+                    self.assertEqual(payload["settings"]["model_precision"], "bnb8")
                     self.assertEqual(payload["settings"]["deterministic_seed"], 4242)
                     self.assertTrue(payload["settings"]["persist_generated_wavs"])
                     self.assertEqual(payload["settings"]["prompt_start_trim_steps"], 3)

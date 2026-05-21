@@ -7,6 +7,7 @@
 - settings presets stored under `backend/data/presets/` plus admin routes for list/save/apply
 - admin UI controls for preset save/apply and local JSON export/import of runtime settings
 - runtime settings for `model_precision`, `deterministic_seed`, `persist_generated_wavs`, `prompt_start_trim_steps`, and VAD trimming parameters
+- `model_precision` now includes experimental `bnb8` and `fp8` quantized inference modes
 - temporary startup admin key support with TTL-based validation alongside the persistent admin key
 - OpenAI-compatible TTS routes for external tools:
   - `GET /v1/models`
@@ -28,6 +29,7 @@
 - public generated audio can stay RAM-only when `persist_generated_wavs=false`; generation metadata remains visible in history even when the WAV itself is no longer persisted to disk
 - OpenAI-style TTS requests accept extra compatibility fields and ignore unknown parameters instead of failing
 - unsupported OpenAI-style `response_format` values now fall back to WAV for compatibility clients
+- quantized `bnb8` and `fp8` modes keep TADA audio heads in regular precision and stream final stable chunks instead of progressive preview chunks
 
 ### Tests
 

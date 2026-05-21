@@ -23,7 +23,7 @@ import soundfile as sf
 import torch
 from huggingface_hub import get_token, snapshot_download
 
-from backend.config_store import ConfigStore, now_iso
+from backend.config_store import ConfigStore, MODEL_PRECISION_ALIASES, SUPPORTED_MODEL_PRECISIONS, now_iso
 from backend.hf_cache import resolve_cached_repo_root, resolve_cached_snapshot, resolve_pretrained_source
 from backend.prompt_batch import ensure_directory, merge_encoder_outputs
 
@@ -92,7 +92,13 @@ SUPPORTED_LANGUAGES = {
     "pt": "Portuguese",
 }
 
-SUPPORTED_MODEL_PRECISIONS = ("fp16", "bf16", "fp32")
+QUANTIZED_MODEL_PRECISIONS = {"bnb8", "fp8"}
+TADA_QUANTIZATION_SKIP_MODULES = (
+    "lm_head",
+    "prediction_head",
+    "bottleneck_proj",
+    "acoustic_proj",
+)
 BYTES_PER_GB = 1024 ** 3
 
 
@@ -539,10 +545,28 @@ class TadaRuntimeService:
 
     def _resolve_model_precision(self, configured_precision: str) -> tuple[str, torch.dtype]:
         normalized = str(configured_precision or "fp16").strip().lower() or "fp16"
+        normalized = MODEL_PRECISION_ALIASES.get(normalized, normalized)
         if normalized not in SUPPORTED_MODEL_PRECISIONS:
             raise ValueError(
                 f"Unsupported model precision '{configured_precision}'. Available: {', '.join(SUPPORTED_MODEL_PRECISIONS)}."
             )
+        if normalized in QUANTIZED_MODEL_PRECISIONS:
+            if self.device.type != "cuda":
+                raise ValueError(f"{normalized.upper()} quantization requires a CUDA GPU.")
+            if normalized == "bnb8" and importlib.util.find_spec("bitsandbytes") is None:
+                raise ValueError("BNB8 quantization requires bitsandbytes. Re-run install.bat to install it.")
+            if normalized == "fp8":
+                try:
+                    from transformers import FineGrainedFP8Config  # noqa: F401
+                except Exception as exc:
+                    raise ValueError(
+                        "FP8 quantization requires a Transformers version with FineGrainedFP8Config. "
+                        "Re-run install.bat to update the runtime."
+                    ) from exc
+                major, _ = torch.cuda.get_device_capability(self.device)
+                if major < 9:
+                    raise ValueError("FP8 quantization requires a CUDA GPU with compute capability >= 9.")
+            return normalized, torch.float16
         if self.device.type != "cuda":
             return "fp32", torch.float32
         if normalized == "bf16":
@@ -552,6 +576,31 @@ class TadaRuntimeService:
         if normalized == "fp16":
             return "fp16", torch.float16
         return "fp32", torch.float32
+
+    def _model_quantization_config(self) -> Any | None:
+        if self.model_precision == "bnb8":
+            try:
+                from transformers import BitsAndBytesConfig
+            except Exception as exc:
+                raise RuntimeError("BNB8 quantization requires bitsandbytes support from Transformers.") from exc
+            return BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_skip_modules=list(TADA_QUANTIZATION_SKIP_MODULES),
+                llm_int8_enable_fp32_cpu_offload=self.enable_cpu_offload,
+            )
+        if self.model_precision == "fp8":
+            try:
+                from transformers import FineGrainedFP8Config
+            except Exception as exc:
+                raise RuntimeError("FP8 quantization requires FineGrainedFP8Config from Transformers.") from exc
+            return FineGrainedFP8Config(modules_to_not_convert=list(TADA_QUANTIZATION_SKIP_MODULES))
+        return None
+
+    def _should_compile_prediction_head(self) -> bool:
+        return self.enable_torch_compile and self.model_precision not in QUANTIZED_MODEL_PRECISIONS
+
+    def _should_stream_previews(self, on_preview: Any | None) -> bool:
+        return on_preview is not None and self.model_precision not in QUANTIZED_MODEL_PRECISIONS
 
     def _hf_token(self) -> str:
         return self.config_store.get_hf_token() or get_token() or ""
@@ -584,7 +633,7 @@ class TadaRuntimeService:
             "cpu_offload": self.enable_cpu_offload,
             "dtype": str(self.model_dtype).replace("torch.", ""),
             "default_flow_steps": DEFAULT_FLOW_STEPS,
-            "torch_compile_enabled": self.enable_torch_compile,
+            "torch_compile_enabled": self._should_compile_prediction_head(),
             "voices_count": len(voices),
             "languages": SUPPORTED_LANGUAGES,
             "hf_token_present": bool(self._hf_token()),
@@ -769,6 +818,10 @@ class TadaRuntimeService:
                     "low_cpu_mem_usage": True,
                     **self._hf_kwargs(),
                 }
+                quantization_config = self._model_quantization_config()
+                if quantization_config is not None:
+                    load_kwargs["quantization_config"] = quantization_config
+                    load_kwargs["device_map"] = "auto"
                 if model_is_local:
                     load_kwargs["local_files_only"] = True
                 if self.device.type == "cuda" and self.enable_cpu_offload:
@@ -786,7 +839,7 @@ class TadaRuntimeService:
                 if "device_map" not in load_kwargs:
                     model = model.to(self.device)
 
-                if self.enable_torch_compile:
+                if self._should_compile_prediction_head():
                     try:
                         import torch._dynamo
 
@@ -1281,9 +1334,10 @@ class TadaRuntimeService:
             sample_rate = self._output_sample_rate(model)
             buffer_samples = max(0, int(sample_rate * settings.stream_start_buffer_ms / 1000))
             min_emit_samples = max(1, int(sample_rate * 0.2))
+            stream_previews = self._should_stream_previews(on_preview)
 
             def progress_callback(update: dict[str, Any]) -> None:
-                if on_preview is None or bool(update.get("is_final")):
+                if not stream_previews or bool(update.get("is_final")):
                     return
                 encoded_batch = update.get("encoded")
                 time_before_batch = update.get("time_before")
@@ -1335,7 +1389,7 @@ class TadaRuntimeService:
                     prompt=merged_prompt,
                     text=[item.text for item in prepared_items],
                     inference_options=options,
-                    progress_callback=progress_callback if on_preview is not None else None,
+                    progress_callback=progress_callback if stream_previews else None,
                     progress_interval_steps=DEFAULT_PROGRESS_INTERVAL_STEPS,
                 )
 

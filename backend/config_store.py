@@ -12,6 +12,17 @@ from pathlib import Path
 from typing import Any
 
 
+SUPPORTED_MODEL_PRECISIONS = ("fp16", "bf16", "fp32", "bnb8", "fp8")
+MODEL_PRECISION_ALIASES = {
+    "8bit": "bnb8",
+    "8-bit": "bnb8",
+    "bitsandbytes": "bnb8",
+    "bnb": "bnb8",
+    "bnb8bit": "bnb8",
+    "int8": "bnb8",
+}
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -62,7 +73,8 @@ def _optional_int(value: Any, *, minimum: int, maximum: int) -> int | None:
 
 def _normalize_model_precision(value: Any, *, default: str = "fp16") -> str:
     candidate = str(value or default).strip().lower() or default
-    if candidate not in {"fp16", "bf16", "fp32"}:
+    candidate = MODEL_PRECISION_ALIASES.get(candidate, candidate)
+    if candidate not in SUPPORTED_MODEL_PRECISIONS:
         return default
     return candidate
 
